@@ -58,4 +58,58 @@ describe("workflow launch form model", () => {
       });
     }
   });
+
+  it("submits non-string enum values using the declared JSON identities", () => {
+    const enumValidation: WorkflowValidationResult = {
+      valid: true,
+      issues: [],
+      summary: null,
+      parameters: [
+        {
+          name: "mode",
+          type: "enum",
+          description: "Mode",
+          required: true,
+          defaultValue: { kind: "review" },
+          values: ["fast", 2, true, { kind: "review" }],
+        },
+      ],
+    };
+
+    const defaultForm = openWorkflowLaunchForm(enumValidation);
+    expect(defaultForm.values.mode).toBe('{"kind":"review"}');
+    expect(submitWorkflowLaunchForm(defaultForm, enumValidation)).toEqual({
+      ok: true,
+      parameters: { mode: { kind: "review" } },
+    });
+
+    const booleanForm = updateWorkflowLaunchValue(defaultForm, "mode", "true");
+    expect(submitWorkflowLaunchForm(booleanForm, enumValidation)).toEqual({
+      ok: true,
+      parameters: { mode: true },
+    });
+  });
+
+  it("rejects enum values that are not declared", () => {
+    const enumValidation: WorkflowValidationResult = {
+      valid: true,
+      issues: [],
+      summary: null,
+      parameters: [
+        {
+          name: "mode",
+          type: "enum",
+          description: "Mode",
+          required: true,
+          values: [1, 2],
+        },
+      ],
+    };
+    const form = updateWorkflowLaunchValue(openWorkflowLaunchForm(enumValidation), "mode", "3");
+    const result = submitWorkflowLaunchForm(form, enumValidation);
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) {
+      expect(result.form.errors.mode).toBe("Choose one of 1, 2");
+    }
+  });
 });

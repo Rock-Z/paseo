@@ -3,7 +3,13 @@ import type { WorkflowRunSummary, WorkflowSpecSummary } from "@getpaseo/protocol
 import { Command } from "commander";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { withOutput } from "../../output/index.js";
-import type { CommandOptions, ListResult, OutputSchema, SingleResult } from "../../output/index.js";
+import type {
+  CommandError,
+  CommandOptions,
+  ListResult,
+  OutputSchema,
+  SingleResult,
+} from "../../output/index.js";
 import { addJsonAndDaemonHostOptions } from "../../utils/command-options.js";
 import { connectToDaemon } from "../../utils/client.js";
 
@@ -248,10 +254,24 @@ async function withClient<T>(
 ): Promise<T> {
   const client = await connectToDaemon({ host: options.host });
   try {
+    assertWorkflowSupport(client);
     return await operation(client);
   } finally {
     await client.close();
   }
+}
+
+interface WorkflowFeatureClient {
+  getLastServerInfoMessage(): { features?: { workflows?: boolean } } | null;
+}
+
+export function assertWorkflowSupport(client: WorkflowFeatureClient): void {
+  // COMPAT(workflows): added in v0.2.5, remove gate after 2027-01-30.
+  if (client.getLastServerInfoMessage()?.features?.workflows === true) return;
+  throw {
+    code: "DAEMON_UPDATE_REQUIRED",
+    message: "Update the host to use native workflows.",
+  } satisfies CommandError;
 }
 
 function requirePayload<T extends { error: string | null }>(payload: T): T {
