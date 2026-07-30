@@ -287,7 +287,7 @@ export class WorkflowService {
       if (!turn.allowedEvents.includes(input.event)) {
         throw new Error(`event ${input.event} is not allowed in this workflow state`);
       }
-      const data = Object.hasOwn(input, "data") ? input.data : {};
+      const data = input.data === undefined ? {} : input.data;
       validateEventData(this.currentEventSchema(tx.state, active.instance, input.event), data);
       const accepted: WorkflowAcceptedEvent = {
         event: input.event,

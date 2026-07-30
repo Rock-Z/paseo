@@ -872,6 +872,42 @@ describe("WorkflowService runtime", () => {
     });
   });
 
+  it("defaults schema-parsed undefined event data without losing the accepted event", async () => {
+    const { service, adapter } = await setup(twoTurnSpec("reuse-agent"));
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Default omitted data" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForStarts(1);
+    const active = adapter.starts[0];
+
+    await service.emitEvent({
+      callerAgentId: active.request.agentId,
+      event: "revised",
+      message: "wire validation materialized data as undefined",
+      data: undefined,
+    });
+    adapter.complete(active.request.agentId);
+
+    await adapter.waitForStarts(2);
+    const details = await service.inspectRun(run.id);
+    expect(details.events.find((event) => event.type === "event_accepted")).toMatchObject({
+      event: "revised",
+      data: {},
+    });
+    const finalTurn = adapter.starts[1];
+    await service.emitEvent({
+      callerAgentId: finalTurn.request.agentId,
+      event: "done",
+      data: { value: "complete" },
+    });
+    adapter.complete(finalTurn.request.agentId);
+    await expect(service.waitForRunTerminal(run.id)).resolves.toMatchObject({
+      status: "complete",
+    });
+  });
+
   it("applies turn and runtime limits without blocking a terminal return", async () => {
     const turnLimitedSpec = twoTurnSpec("reuse-agent");
     turnLimitedSpec.limits = { maxIterations: 1, maxRuntime: "1h" };
