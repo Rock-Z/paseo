@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { WorkflowStorage } from "./storage.js";
+import { type WorkflowCommitBoundary, WorkflowStorage } from "./storage.js";
 
 const roots: string[] = [];
 
@@ -126,6 +126,186 @@ describe("WorkflowStorage", () => {
     ]);
     const files = await fs.readdir(path.join(paseoHome, "workflows", "runs", "run-1"));
     expect(files.some((name) => name.endsWith(".tmp"))).toBe(false);
+  });
+
+  it.each([
+    { step: "journal", phase: "before" },
+    { step: "journal", phase: "after" },
+    { step: "event", phase: "before", index: 0 },
+    { step: "event", phase: "after", index: 0 },
+    { step: "event", phase: "before", index: 1 },
+    { step: "event", phase: "after", index: 1 },
+    { step: "accepted-event", phase: "before", index: 0 },
+    { step: "accepted-event", phase: "after", index: 0 },
+    { step: "accepted-event", phase: "before", index: 1 },
+    { step: "accepted-event", phase: "after", index: 1 },
+    { step: "state", phase: "before" },
+    { step: "state", phase: "after" },
+    { step: "journal-cleanup", phase: "before" },
+    { step: "journal-cleanup", phase: "after" },
+  ] satisfies WorkflowCommitBoundary[])(
+    "recovers a state and audit transaction after $phase $step $index",
+    async (failurePoint) => {
+      const { storage, paseoHome, builtIns } = await makeStorage();
+      const now = "2026-07-30T00:00:00.000Z";
+      const initialState = {
+        schemaVersion: "paseo.workflows.run.v0.2",
+        runId: "transaction-run",
+        workflow: { id: "custom", name: "custom" },
+        status: "queued",
+        reason: null,
+        createdAt: now,
+        updatedAt: now,
+        startedAt: null,
+        completedAt: null,
+        loop: { iteration: 0, elapsedSeconds: 0 },
+        eventSeq: 1,
+        instances: {},
+      };
+      await storage.createRun("transaction-run", spec(), initialState);
+      await storage.appendEvent("transaction-run", {
+        seq: 1,
+        timestamp: now,
+        type: "run_queued",
+      });
+      const nextState = {
+        ...initialState,
+        status: "running",
+        updatedAt: "2026-07-30T00:00:01.000Z",
+        startedAt: "2026-07-30T00:00:01.000Z",
+        eventSeq: 3,
+      };
+      let injected = false;
+      const crashingStorage = new WorkflowStorage({
+        paseoHome,
+        builtInDirectory: builtIns,
+        commitBoundaryHook: (boundary) => {
+          if (!injected && JSON.stringify(boundary) === JSON.stringify(failurePoint)) {
+            injected = true;
+            throw new Error(`injected ${boundary.step} ${boundary.phase}`);
+          }
+        },
+      });
+      await crashingStorage.initialize();
+
+      await expect(
+        crashingStorage.commitRunTransaction("transaction-run", {
+          state: nextState,
+          events: [
+            {
+              seq: 2,
+              timestamp: "2026-07-30T00:00:01.000Z",
+              type: "run_started",
+            },
+            {
+              seq: 3,
+              timestamp: "2026-07-30T00:00:02.000Z",
+              type: "event_accepted",
+              event: "done",
+              data: null,
+            },
+          ],
+          acceptedEvents: [
+            {
+              workflowTurnId: "wft_one",
+              event: {
+                event: "done",
+                message: "one",
+                data: null,
+                acceptedAt: "2026-07-30T00:00:02.000Z",
+                nativeTurnId: "turn-1",
+              },
+            },
+            {
+              workflowTurnId: "wft_two",
+              event: {
+                event: "done",
+                message: "two",
+                data: { value: 2 },
+                acceptedAt: "2026-07-30T00:00:02.000Z",
+                nativeTurnId: "turn-2",
+              },
+            },
+          ],
+        }),
+      ).rejects.toThrow("injected");
+      expect(injected).toBe(true);
+
+      const recovered = new WorkflowStorage({ paseoHome, builtInDirectory: builtIns });
+      await recovered.initialize();
+      const details = await recovered.inspectRun("transaction-run");
+      const commitBegan = !(failurePoint.step === "journal" && failurePoint.phase === "before");
+      expect(details.run.status).toBe(commitBegan ? "running" : "queued");
+      expect(details.events.map((event) => event.seq)).toEqual(commitBegan ? [1, 2, 3] : [1]);
+      expect(new Set(details.events.map((event) => event.seq)).size).toBe(details.events.length);
+      expect(details.state.eventSeq).toBe(details.events.at(-1)?.seq);
+      const historyDirectory = path.join(
+        paseoHome,
+        "workflows",
+        "runs",
+        "transaction-run",
+        "event-history",
+      );
+      expect((await fs.readdir(historyDirectory)).sort()).toEqual(
+        commitBegan ? ["wft_one.json", "wft_two.json"] : [],
+      );
+      await expect(
+        fs.access(
+          path.join(paseoHome, "workflows", "runs", "transaction-run", "pending-commit.json"),
+        ),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it("only exposes rendered prompts referenced by durable workflow state", async () => {
+    const { storage } = await makeStorage();
+    const now = "2026-07-30T00:00:00.000Z";
+    await storage.createRun("prompt-audit", spec(), {
+      schemaVersion: "paseo.workflows.run.v0.2",
+      runId: "prompt-audit",
+      workflow: { id: "custom", name: "custom" },
+      status: "running",
+      createdAt: now,
+      updatedAt: now,
+      loop: { iteration: 1 },
+      instances: {
+        root: {
+          activeTurn: {
+            workflowTurnId: "wft_visible",
+            instanceId: "root",
+            agentId: "agent-1",
+            promptPath: "visible.txt",
+            createdAt: now,
+          },
+        },
+      },
+    });
+    await storage.writePrompt("prompt-audit", {
+      name: "visible.txt",
+      workflowTurnId: "wft_visible",
+      instanceId: "root",
+      agentId: "agent-1",
+      createdAt: now,
+      content: "visible prompt",
+    });
+    await storage.writePrompt("prompt-audit", {
+      name: "orphan.txt",
+      workflowTurnId: "wft_orphan",
+      instanceId: "root",
+      agentId: "agent-private",
+      createdAt: now,
+      content: "historical private prompt",
+    });
+
+    await expect(storage.inspectRun("prompt-audit")).resolves.toMatchObject({
+      prompts: [
+        {
+          name: "visible.txt",
+          workflowTurnId: "wft_visible",
+          content: "visible prompt",
+        },
+      ],
+    });
   });
 
   it("reads historical spec.yaml runs without making unsafe legacy states resumable", async () => {

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type {
@@ -8,16 +9,35 @@ import type {
   WorkflowRunSummary,
   WorkflowSpecSummary,
 } from "@getpaseo/protocol/workflow/types";
+import { WorkflowEventRecordSchema } from "@getpaseo/protocol/workflow/types";
 import { parse as parseYaml } from "yaml";
 import { writeFileAtomic, writeJsonFileAtomic } from "../atomic-file.js";
 import { canonicalJson, type JsonObject, validateWorkflowTemplate } from "./spec.js";
+import { type WorkflowAcceptedEvent, WorkflowAcceptedEventSchema } from "./state.js";
 
 const WORKFLOW_ID = /^[a-z0-9][a-z0-9-]*$/;
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+const PENDING_COMMIT_FILE = "pending-commit.json";
+
+export interface WorkflowCommitBoundary {
+  step: "journal" | "event" | "accepted-event" | "state" | "journal-cleanup";
+  phase: "before" | "after";
+  index?: number;
+}
+
+export interface WorkflowRunTransaction {
+  state: JsonObject;
+  events: WorkflowEventRecord[];
+  acceptedEvents: Array<{
+    workflowTurnId: string;
+    event: WorkflowAcceptedEvent;
+  }>;
+}
 
 export interface WorkflowStorageOptions {
   paseoHome: string;
   builtInDirectory: string;
+  commitBoundaryHook?: (boundary: WorkflowCommitBoundary) => void | Promise<void>;
 }
 
 export class WorkflowStorage {
@@ -26,6 +46,10 @@ export class WorkflowStorage {
   readonly runRoot: string;
   readonly legacyRunRoot: string;
   private readonly builtInDirectory: string;
+  private readonly commitBoundaryHook:
+    | ((boundary: WorkflowCommitBoundary) => void | Promise<void>)
+    | undefined;
+  private readonly runLocks = new Map<string, Promise<void>>();
 
   constructor(options: WorkflowStorageOptions) {
     this.root = path.join(options.paseoHome, "workflows");
@@ -33,12 +57,16 @@ export class WorkflowStorage {
     this.runRoot = path.join(this.root, "runs");
     this.legacyRunRoot = path.join(options.paseoHome, "workflow-runs");
     this.builtInDirectory = options.builtInDirectory;
+    this.commitBoundaryHook = options.commitBoundaryHook;
   }
 
   async initialize(): Promise<void> {
     await this.ensureDirectory(this.root);
     await this.ensureDirectory(this.userSpecRoot);
     await this.ensureDirectory(this.runRoot);
+    for (const runId of await listDirectories(this.runRoot)) {
+      if (RUN_ID.test(runId)) await this.recoverRun(runId);
+    }
   }
 
   async listSpecs(): Promise<WorkflowSpecSummary[]> {
@@ -104,29 +132,47 @@ export class WorkflowStorage {
     return value;
   }
 
-  async createRun(runId: string, spec: JsonObject, state: JsonObject): Promise<void> {
+  async createRun(
+    runId: string,
+    spec: JsonObject,
+    state: JsonObject,
+    events: WorkflowEventRecord[] = [],
+  ): Promise<void> {
     assertRunId(runId);
     await this.ensureDirectory(this.runRoot);
     const runDirectory = path.join(this.runRoot, runId);
+    if (await exists(runDirectory)) {
+      throw new Error(`workflow run already exists: ${runId}`);
+    }
+    const temporaryDirectory = path.join(
+      this.runRoot,
+      `.${runId}.${process.pid}.${randomUUID()}.tmp`,
+    );
     try {
-      await fs.mkdir(runDirectory);
+      await fs.mkdir(temporaryDirectory);
+      await fs.mkdir(path.join(temporaryDirectory, "rendered-prompts"));
+      await fs.mkdir(path.join(temporaryDirectory, "event-history"));
+      await writeFileAtomic(
+        path.join(temporaryDirectory, "spec.json"),
+        `${JSON.stringify(spec, null, 2)}\n`,
+      );
+      await writeJsonFileAtomic(path.join(temporaryDirectory, "state.json"), state);
+      await writeFileAtomic(
+        path.join(temporaryDirectory, "events.jsonl"),
+        events.length > 0 ? `${events.map(canonicalJson).join("\n")}\n` : "",
+      );
+      await fs.rename(temporaryDirectory, runDirectory);
     } catch (error) {
-      if (isNodeError(error) && error.code === "EEXIST") {
+      await fs.rm(temporaryDirectory, { recursive: true, force: true });
+      if (isNodeError(error) && ["EEXIST", "ENOTEMPTY"].includes(error.code ?? "")) {
         throw new Error(`workflow run already exists: ${runId}`, { cause: error });
       }
       throw error;
     }
-    await fs.mkdir(path.join(runDirectory, "rendered-prompts"));
-    await fs.mkdir(path.join(runDirectory, "event-history"));
-    await writeFileAtomic(
-      path.join(runDirectory, "spec.json"),
-      `${JSON.stringify(spec, null, 2)}\n`,
-    );
-    await writeJsonFileAtomic(path.join(runDirectory, "state.json"), state);
-    await writeFileAtomic(path.join(runDirectory, "events.jsonl"), "");
   }
 
   async readState(runId: string): Promise<JsonObject> {
+    await this.recoverRun(runId);
     const { directory } = await this.resolveRun(runId);
     try {
       return await readJsonObject(path.join(directory, "state.json"), "workflow state");
@@ -138,25 +184,54 @@ export class WorkflowStorage {
   }
 
   async saveState(runId: string, state: JsonObject): Promise<void> {
+    await this.recoverRun(runId);
     const { directory, legacy } = await this.resolveRun(runId);
     if (legacy) {
       throw new Error(`legacy workflow state is read-only: ${runId}`);
     }
-    await writeJsonFileAtomic(path.join(directory, "state.json"), state);
+    const statePath = path.join(directory, "state.json");
+    await assertNotSymlink(statePath);
+    await writeJsonFileAtomic(statePath, state);
   }
 
   async appendEvent(runId: string, event: WorkflowEventRecord): Promise<void> {
+    await this.recoverRun(runId);
     const { directory, legacy } = await this.resolveRun(runId);
     if (legacy) {
       throw new Error(`legacy workflow audit is read-only: ${runId}`);
     }
-    const handle = await fs.open(path.join(directory, "events.jsonl"), "a");
+    const eventsPath = path.join(directory, "events.jsonl");
+    await assertNotSymlink(eventsPath);
+    const handle = await fs.open(eventsPath, "a");
     try {
       await handle.write(`${canonicalJson(event)}\n`);
       await handle.sync();
     } finally {
       await handle.close();
     }
+  }
+
+  async commitRunTransaction(runId: string, transaction: WorkflowRunTransaction): Promise<void> {
+    assertRunId(runId);
+    await this.withRunLock(runId, async () => {
+      const { directory, legacy } = await this.resolveRun(runId);
+      if (legacy) {
+        throw new Error(`legacy workflow state is read-only: ${runId}`);
+      }
+      await this.recoverPendingCommit(directory, runId);
+      const pending: PendingWorkflowCommit = {
+        schemaVersion: "paseo.workflows.commit.v1",
+        runId,
+        state: transaction.state,
+        events: transaction.events,
+        acceptedEvents: transaction.acceptedEvents,
+      };
+      const journalPath = path.join(directory, PENDING_COMMIT_FILE);
+      await this.reachCommitBoundary({ step: "journal", phase: "before" });
+      await writeJsonFileAtomic(journalPath, pending);
+      await this.reachCommitBoundary({ step: "journal", phase: "after" });
+      await this.applyPendingCommit(directory, pending, true);
+    });
   }
 
   async writePrompt(
@@ -168,7 +243,9 @@ export class WorkflowStorage {
       throw new Error(`legacy workflow prompts are read-only: ${runId}`);
     }
     const name = safePromptName(prompt.name);
-    await writeFileAtomic(path.join(directory, "rendered-prompts", name), prompt.content);
+    const promptDirectory = path.join(directory, "rendered-prompts");
+    await assertDirectoryNotSymlink(promptDirectory);
+    await writeFileAtomic(path.join(promptDirectory, name), prompt.content);
     return name;
   }
 
@@ -183,6 +260,7 @@ export class WorkflowStorage {
       nativeTurnId: string;
     },
   ): Promise<void> {
+    await this.recoverRun(runId);
     const { directory, legacy } = await this.resolveRun(runId);
     if (legacy) {
       throw new Error(`legacy workflow event history is read-only: ${runId}`);
@@ -190,7 +268,9 @@ export class WorkflowStorage {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(workflowTurnId)) {
       throw new Error(`invalid workflow turn id: ${workflowTurnId}`);
     }
-    const filePath = path.join(directory, "event-history", `${workflowTurnId}.json`);
+    const historyDirectory = path.join(directory, "event-history");
+    await assertDirectoryNotSymlink(historyDirectory);
+    const filePath = path.join(historyDirectory, `${workflowTurnId}.json`);
     if (await exists(filePath)) {
       throw new Error(`workflow event was already accepted: ${workflowTurnId}`);
     }
@@ -198,6 +278,7 @@ export class WorkflowStorage {
   }
 
   async inspectRun(runId: string): Promise<WorkflowRunDetails> {
+    await this.recoverRun(runId);
     const resolved = await this.resolveRun(runId);
     const state = await this.readState(runId);
     const spec = await this.readRunSpec(resolved);
@@ -268,6 +349,112 @@ export class WorkflowStorage {
     throw new Error(`workflow run not found: ${runId}`);
   }
 
+  private async recoverRun(runId: string): Promise<void> {
+    assertRunId(runId);
+    await this.withRunLock(runId, async () => {
+      const resolved = await this.resolveRun(runId);
+      if (!resolved.legacy) {
+        await this.recoverPendingCommit(resolved.directory, runId);
+      }
+    });
+  }
+
+  private async recoverPendingCommit(directory: string, runId: string): Promise<void> {
+    const journalPath = path.join(directory, PENDING_COMMIT_FILE);
+    if (!(await exists(journalPath))) return;
+    await assertNotSymlink(journalPath);
+    const value = JSON.parse(await fs.readFile(journalPath, "utf8")) as unknown;
+    const pending = parsePendingCommit(value);
+    if (pending.runId !== runId) {
+      throw new Error(
+        `workflow commit journal identity mismatch: expected ${runId}, got ${pending.runId}`,
+      );
+    }
+    await this.applyPendingCommit(directory, pending, false);
+  }
+
+  private async applyPendingCommit(
+    directory: string,
+    pending: PendingWorkflowCommit,
+    notifyBoundaries: boolean,
+  ): Promise<void> {
+    const eventsPath = path.join(directory, "events.jsonl");
+    const statePath = path.join(directory, "state.json");
+    await assertNotSymlink(eventsPath);
+    await assertNotSymlink(statePath);
+    await assertDirectoryNotSymlink(path.join(directory, "event-history"));
+    await repairPartialEventAppend(eventsPath, pending.events);
+    for (const [index, event] of pending.events.entries()) {
+      if (notifyBoundaries) {
+        await this.reachCommitBoundary({ step: "event", phase: "before", index });
+      }
+      await appendEventIdempotently(eventsPath, event);
+      if (notifyBoundaries) {
+        await this.reachCommitBoundary({ step: "event", phase: "after", index });
+      }
+    }
+    for (const [index, accepted] of pending.acceptedEvents.entries()) {
+      if (notifyBoundaries) {
+        await this.reachCommitBoundary({
+          step: "accepted-event",
+          phase: "before",
+          index,
+        });
+      }
+      await writeAcceptedEventIdempotently(directory, accepted);
+      if (notifyBoundaries) {
+        await this.reachCommitBoundary({
+          step: "accepted-event",
+          phase: "after",
+          index,
+        });
+      }
+    }
+    const auditSequence = (await readCanonicalEvents(eventsPath)).at(-1)?.seq ?? 0;
+    if (pending.state.eventSeq !== auditSequence) {
+      throw new Error(
+        `workflow state event sequence ${String(pending.state.eventSeq)} does not match audit ${auditSequence}`,
+      );
+    }
+    if (notifyBoundaries) {
+      await this.reachCommitBoundary({ step: "state", phase: "before" });
+    }
+    await writeJsonFileAtomic(statePath, pending.state);
+    if (notifyBoundaries) {
+      await this.reachCommitBoundary({ step: "state", phase: "after" });
+      await this.reachCommitBoundary({ step: "journal-cleanup", phase: "before" });
+    }
+    await fs.rm(path.join(directory, PENDING_COMMIT_FILE));
+    if (notifyBoundaries) {
+      await this.reachCommitBoundary({ step: "journal-cleanup", phase: "after" });
+    }
+  }
+
+  private async reachCommitBoundary(boundary: WorkflowCommitBoundary): Promise<void> {
+    await this.commitBoundaryHook?.(boundary);
+  }
+
+  private async withRunLock<T>(runId: string, callback: () => Promise<T>): Promise<T> {
+    const previous = this.runLocks.get(runId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => current);
+    this.runLocks.set(runId, tail);
+    await previous;
+    try {
+      return await callback();
+    } finally {
+      release();
+      if (this.runLocks.get(runId) === tail) {
+        void tail.finally(() => {
+          if (this.runLocks.get(runId) === tail) this.runLocks.delete(runId);
+        });
+      }
+    }
+  }
+
   private async ensureDirectory(directory: string): Promise<void> {
     await fs.mkdir(directory, { recursive: true });
     await assertDirectoryNotSymlink(directory);
@@ -277,6 +464,11 @@ export class WorkflowStorage {
 interface ResolvedRun {
   directory: string;
   legacy: boolean;
+}
+
+interface PendingWorkflowCommit extends WorkflowRunTransaction {
+  schemaVersion: "paseo.workflows.commit.v1";
+  runId: string;
 }
 
 function summarizeRun(runId: string, state: JsonObject, legacy: boolean): WorkflowRunSummary {
@@ -399,12 +591,13 @@ async function readPrompts(
     const filePath = path.join(directory, name);
     await assertNotSymlink(filePath);
     const identity = identities.get(name);
+    if (!identity) continue;
     prompts.push({
       name,
-      workflowTurnId: identity?.workflowTurnId ?? null,
-      instanceId: identity?.instanceId ?? null,
-      agentId: identity?.agentId ?? null,
-      createdAt: identity?.createdAt ?? null,
+      workflowTurnId: identity.workflowTurnId,
+      instanceId: identity.instanceId,
+      agentId: identity.agentId,
+      createdAt: identity.createdAt,
       content: await fs.readFile(filePath, "utf8"),
     });
   }
@@ -438,6 +631,112 @@ function collectPromptIdentities(
     });
   }
   for (const item of Object.values(value)) collectPromptIdentities(item, result);
+}
+
+function parsePendingCommit(value: unknown): PendingWorkflowCommit {
+  if (
+    !isObject(value) ||
+    value.schemaVersion !== "paseo.workflows.commit.v1" ||
+    typeof value.runId !== "string" ||
+    !isObject(value.state) ||
+    !Array.isArray(value.events) ||
+    !Array.isArray(value.acceptedEvents)
+  ) {
+    throw new Error("invalid workflow commit journal");
+  }
+  const events = value.events.map((event) => WorkflowEventRecordSchema.parse(event));
+  const acceptedEvents = value.acceptedEvents.map((accepted) => {
+    if (!isObject(accepted) || typeof accepted.workflowTurnId !== "string") {
+      throw new Error("invalid accepted event in workflow commit journal");
+    }
+    return {
+      workflowTurnId: accepted.workflowTurnId,
+      event: WorkflowAcceptedEventSchema.parse(accepted.event),
+    };
+  });
+  return {
+    schemaVersion: "paseo.workflows.commit.v1",
+    runId: value.runId,
+    state: value.state,
+    events,
+    acceptedEvents,
+  };
+}
+
+async function repairPartialEventAppend(
+  filePath: string,
+  pendingEvents: WorkflowEventRecord[],
+): Promise<void> {
+  const text = await fs.readFile(filePath, "utf8");
+  if (!text || text.endsWith("\n")) return;
+  const lastNewline = text.lastIndexOf("\n");
+  const completeText = text.slice(0, lastNewline + 1);
+  const trailing = text.slice(lastNewline + 1);
+  const matchesPendingEvent = pendingEvents.some((event) =>
+    `${canonicalJson(event)}\n`.startsWith(trailing),
+  );
+  if (!matchesPendingEvent) {
+    throw new Error("workflow audit has a partial record outside the pending transaction");
+  }
+  await fs.truncate(filePath, Buffer.byteLength(completeText));
+}
+
+async function appendEventIdempotently(
+  filePath: string,
+  event: WorkflowEventRecord,
+): Promise<void> {
+  const existing = await readCanonicalEvents(filePath);
+  const sameSequence = existing.find((candidate) => candidate.seq === event.seq);
+  if (sameSequence) {
+    if (canonicalJson(sameSequence) !== canonicalJson(event)) {
+      throw new Error(`workflow audit event ${event.seq} conflicts with pending transaction`);
+    }
+    return;
+  }
+  const lastSequence = existing.at(-1)?.seq ?? 0;
+  if (event.seq !== lastSequence + 1) {
+    throw new Error(`workflow audit event ${event.seq} is not contiguous after ${lastSequence}`);
+  }
+  const handle = await fs.open(filePath, "a");
+  try {
+    await handle.write(`${canonicalJson(event)}\n`);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readCanonicalEvents(filePath: string): Promise<WorkflowEventRecord[]> {
+  const text = await fs.readFile(filePath, "utf8");
+  const events = text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => WorkflowEventRecordSchema.parse(JSON.parse(line) as unknown));
+  for (let index = 1; index < events.length; index += 1) {
+    if (events[index]!.seq <= events[index - 1]!.seq) {
+      throw new Error("workflow audit event sequences are not strictly increasing");
+    }
+  }
+  return events;
+}
+
+async function writeAcceptedEventIdempotently(
+  directory: string,
+  accepted: WorkflowRunTransaction["acceptedEvents"][number],
+): Promise<void> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(accepted.workflowTurnId)) {
+    throw new Error(`invalid workflow turn id: ${accepted.workflowTurnId}`);
+  }
+  const filePath = path.join(directory, "event-history", `${accepted.workflowTurnId}.json`);
+  if (await exists(filePath)) {
+    await assertNotSymlink(filePath);
+    const existing = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
+    if (canonicalJson(existing) !== canonicalJson(accepted.event)) {
+      throw new Error(`workflow event history conflicts for ${accepted.workflowTurnId}`);
+    }
+    return;
+  }
+  await writeJsonFileAtomic(filePath, accepted.event);
 }
 
 async function readJsonObject(filePath: string, label: string): Promise<JsonObject> {

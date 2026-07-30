@@ -159,13 +159,14 @@ export class WorkflowService {
       instances: { root },
       result: null,
     };
-    await this.storage.createRun(runId, spec, state as unknown as JsonObject);
-    await this.storage.appendEvent(runId, {
-      seq: 1,
-      timestamp: now,
-      type: "run_queued",
-      details: { runId, workflowId: input.workflowId },
-    });
+    await this.storage.createRun(runId, spec, state as unknown as JsonObject, [
+      {
+        seq: 1,
+        timestamp: now,
+        type: "run_queued",
+        details: { runId, workflowId: input.workflowId },
+      },
+    ]);
     this.kick(runId);
     return (await this.storage.inspectRun(runId)).run;
   }
@@ -223,7 +224,10 @@ export class WorkflowService {
       if (tx.state.status === "complete") {
         throw new Error(`completed workflow runs cannot be resumed: ${runId}`);
       }
-      if (tx.state.status !== "stopped" && tx.state.status !== "failed") {
+      if (tx.state.status === "failed") {
+        throw new Error(`failed workflow runs cannot be resumed: ${runId}`);
+      }
+      if (tx.state.status !== "stopped") {
         throw new Error(`workflow run is not stopped: ${runId}`);
       }
       tx.state.status = "running";
@@ -266,9 +270,8 @@ export class WorkflowService {
       }
       const { turn } = active;
       const nativeTurnId = this.adapter.getActiveTurnId(input.callerAgentId);
-      if (turn.phase === "launching" && nativeTurnId) {
-        turn.nativeTurnId = nativeTurnId;
-        turn.phase = "running";
+      if (turn.phase !== "running" && nativeTurnId) {
+        recordTurnStarted(tx, active.instance.id, turn.workflowTurnId, nativeTurnId);
       }
       if (
         turn.phase !== "running" ||
@@ -284,7 +287,7 @@ export class WorkflowService {
       if (!turn.allowedEvents.includes(input.event)) {
         throw new Error(`event ${input.event} is not allowed in this workflow state`);
       }
-      const data = input.data ?? {};
+      const data = Object.hasOwn(input, "data") ? input.data : {};
       validateEventData(this.currentEventSchema(tx.state, active.instance, input.event), data);
       const accepted: WorkflowAcceptedEvent = {
         event: input.event,
@@ -585,7 +588,7 @@ export class WorkflowService {
     instanceId: string,
     turn: WorkflowActiveTurn,
   ): Promise<void> {
-    if (turn.agentId && turn.phase !== "queued") {
+    if (turn.agentId) {
       const reconciliation = await this.adapter.reconcileTurn({
         agentId: turn.agentId,
         nativeTurnId: turn.nativeTurnId,
@@ -649,23 +652,7 @@ export class WorkflowService {
       },
       async (nativeTurnId) => {
         await this.transact(runId, (tx) => {
-          const active = requireActiveTurn(tx.state, instanceId, turn.workflowTurnId);
-          active.nativeTurnId = nativeTurnId;
-          active.phase = "running";
-          queueEvent(tx, {
-            type: "turn_started",
-            instanceId,
-            flow: active.flow,
-            state: active.state,
-            agent: active.agent,
-            agentId,
-            details: {
-              workflowTurnId: active.workflowTurnId,
-              nativeTurnId,
-              iteration: active.iteration,
-              allowedEvents: active.allowedEvents,
-            },
-          });
+          recordTurnStarted(tx, instanceId, turn.workflowTurnId, nativeTurnId);
         });
       },
     );
@@ -681,11 +668,28 @@ export class WorkflowService {
       await this.transact(runId, (tx) => {
         const instance = requireInstance(tx.state, instanceId);
         if (!instance.activeTurn) return;
-        instance.activeTurn.nativeTurnId = reconciliation.nativeTurnId;
-        instance.activeTurn.phase = "running";
+        recordTurnStarted(
+          tx,
+          instanceId,
+          instance.activeTurn.workflowTurnId,
+          reconciliation.nativeTurnId,
+        );
       });
       await this.completeTurn(runId, instanceId, await reconciliation.result);
       return;
+    }
+    const reconciledNativeTurnId = reconciliation.result.nativeTurnId;
+    if (reconciledNativeTurnId) {
+      await this.transact(runId, (tx) => {
+        const instance = requireInstance(tx.state, instanceId);
+        if (!instance.activeTurn) return;
+        recordTurnStarted(
+          tx,
+          instanceId,
+          instance.activeTurn.workflowTurnId,
+          reconciledNativeTurnId,
+        );
+      });
     }
     await this.completeTurn(runId, instanceId, reconciliation.result);
   }
@@ -935,13 +939,11 @@ export class WorkflowService {
       const transaction: Transaction = { state, events: [], acceptedEvents: [] };
       const result = await callback(transaction);
       state.updatedAt = new Date().toISOString();
-      await this.storage.saveState(runId, state as unknown as JsonObject);
-      for (const event of transaction.events) {
-        await this.storage.appendEvent(runId, event);
-      }
-      for (const accepted of transaction.acceptedEvents) {
-        await this.storage.writeAcceptedEvent(runId, accepted.workflowTurnId, accepted.event);
-      }
+      await this.storage.commitRunTransaction(runId, {
+        state: state as unknown as JsonObject,
+        events: transaction.events,
+        acceptedEvents: transaction.acceptedEvents,
+      });
       return result;
     });
   }
@@ -1350,6 +1352,38 @@ function validateEventData(schema: unknown, data: unknown): void {
     .map((error) => `${error.instancePath || "(root)"} ${error.message ?? "is invalid"}`)
     .join("; ");
   throw new Error(`workflow event data is invalid: ${errors}`);
+}
+
+function recordTurnStarted(
+  tx: Transaction,
+  instanceId: string,
+  workflowTurnId: string,
+  nativeTurnId: string,
+): void {
+  const active = requireActiveTurn(tx.state, instanceId, workflowTurnId);
+  if (active.nativeTurnId && active.nativeTurnId !== nativeTurnId) {
+    throw new Error(`native turn identity changed for ${workflowTurnId}`);
+  }
+  if (active.phase === "running" && active.nativeTurnId === nativeTurnId) return;
+  if (!active.agentId) {
+    throw new Error(`workflow turn has no native agent identity: ${workflowTurnId}`);
+  }
+  active.nativeTurnId = nativeTurnId;
+  active.phase = "running";
+  queueEvent(tx, {
+    type: "turn_started",
+    instanceId,
+    flow: active.flow,
+    state: active.state,
+    agent: active.agent,
+    agentId: active.agentId,
+    details: {
+      workflowTurnId: active.workflowTurnId,
+      nativeTurnId,
+      iteration: active.iteration,
+      allowedEvents: active.allowedEvents,
+    },
+  });
 }
 
 function queueEvent(tx: Transaction, event: Omit<WorkflowEventRecord, "seq" | "timestamp">): void {

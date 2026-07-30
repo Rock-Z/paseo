@@ -75,16 +75,20 @@ $PASEO_HOME/workflows/
     └── event-history/
 ```
 
-`spec.json` is the fully materialized canonical JSON used by that run. `state.json` is replaced
-atomically. `events.jsonl` is append-only. Rendered prompts and accepted-event records retain the
-workflow turn, native turn, agent, and flow identities needed for inspection and replay rejection.
-The run state retains active and completed turn identities plus agent and workspace control targets.
+`spec.json` is the fully materialized canonical JSON used by that run. State transitions, audit
+events, and accepted-event records commit through a per-run journal. Recovery finishes a journal
+idempotently before exposing the run, then removes it. `state.json` is replaced atomically and
+`events.jsonl` remains append-only. Rendered prompts and accepted-event records retain the workflow
+turn, native turn, agent, and flow identities needed for inspection and replay rejection. The run
+state retains active and completed turn identities plus agent and workspace control targets.
 
 On daemon startup, `WorkflowService` loads non-terminal intent and reconciles each recorded turn
 against the existing Paseo agent and its canonical timeline. It calls the normal
 `ensureAgentLoaded()` path; it does not restore provider sessions itself. A matching active turn is
-awaited, a matching completed turn is consumed, and only a missing turn can be launched. The stable
-workflow client message ID prevents a recovered turn from being appended twice.
+awaited, a matching completed turn is consumed, and only a missing turn can be launched. The agent
+identity and stable client message ID are durable before native submission, so queued and launching
+turns reconcile through the same timeline path even when the daemon exits before the native turn ID
+is recorded.
 
 Historical `$PASEO_HOME/workflow-runs/{run-id}/spec.yaml` runs remain inspectable. The reader
 normalizes their state and audit records without mutating them. They remain non-resumable unless the

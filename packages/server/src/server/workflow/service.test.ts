@@ -25,17 +25,24 @@ interface PendingTurn {
 class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
   readonly starts: PendingTurn[] = [];
   readonly prompts: string[] = [];
+  readonly externalEffects: string[] = [];
   readonly agentCreates: Array<{ instanceId: string; role: string; agentId: string }> = [];
   readonly workspaceCreates: string[] = [];
   readonly idleWaits: string[] = [];
+  readonly reconciliations: Array<{
+    agentId: string;
+    nativeTurnId: string | null;
+  }> = [];
   validateGate: Promise<void> = Promise.resolve();
   idleGate: Promise<void> = Promise.resolve();
+  pauseAfterNativeSubmission = false;
   maxActive = 0;
   private active = new Map<string, PendingTurn>();
   private nextAgent = 1;
   private nextTurn = 1;
   private waiters: Array<() => void> = [];
   private idleWaiters: Array<() => void> = [];
+  private reconciliationWaiters: Array<() => void> = [];
 
   async resolveCallerContext(input: {
     workspaceId?: string;
@@ -101,8 +108,13 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     const pending = { request, nativeTurnId, resolve, result };
     this.starts.push(pending);
     this.prompts.push(request.prompt);
+    this.externalEffects.push(request.clientMessageId);
     this.active.set(request.agentId, pending);
     this.maxActive = Math.max(this.maxActive, this.active.size);
+    if (this.pauseAfterNativeSubmission) {
+      this.flushWaiters();
+      return new Promise<WorkflowTurnResult>(() => undefined);
+    }
     await onStarted(nativeTurnId);
     this.flushWaiters();
     return result;
@@ -112,6 +124,8 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     agentId: string;
     nativeTurnId: string | null;
   }): Promise<WorkflowTurnReconciliation> {
+    this.reconciliations.push(input);
+    this.flushReconciliationWaiters();
     const pending = this.active.get(input.agentId);
     if (!pending) return { state: "missing" };
     return {
@@ -135,6 +149,12 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     if (this.idleWaits.length >= count) return;
     await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
     if (this.idleWaits.length < count) await this.waitForIdleWaits(count);
+  }
+
+  async waitForReconciliations(count: number): Promise<void> {
+    if (this.reconciliations.length >= count) return;
+    await new Promise<void>((resolve) => this.reconciliationWaiters.push(resolve));
+    if (this.reconciliations.length < count) await this.waitForReconciliations(count);
   }
 
   complete(agentId: string, status: WorkflowTurnResult["status"] = "completed"): void {
@@ -170,6 +190,10 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
 
   private flushIdleWaiters(): void {
     for (const resolve of this.idleWaiters.splice(0)) resolve();
+  }
+
+  private flushReconciliationWaiters(): void {
+    for (const resolve of this.reconciliationWaiters.splice(0)) resolve();
   }
 }
 
@@ -695,6 +719,28 @@ describe("WorkflowService runtime", () => {
     });
   });
 
+  it("does not resume a failed run as if it were gracefully stopped", async () => {
+    const { service, storage, adapter } = await setup(baseSpec());
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Fail once" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForStarts(1);
+    service.dispose();
+    const failedState = await storage.readState(run.id);
+    failedState.status = "failed";
+    failedState.reason = "controlled failure";
+    await storage.saveState(run.id, failedState);
+
+    await expect(service.resumeRun(run.id)).rejects.toThrow(
+      `failed workflow runs cannot be resumed: ${run.id}`,
+    );
+    await expect(service.inspectRun(run.id)).resolves.toMatchObject({
+      run: { status: "failed", resumable: false },
+    });
+  });
+
   it("reconciles a persisted native turn after restart without launching a duplicate", async () => {
     const firstProcess = await setup(baseSpec());
     const run = await firstProcess.service.startRun({
@@ -713,6 +759,7 @@ describe("WorkflowService runtime", () => {
       adapter: restartedAdapter,
     });
     await restartedService.initialize();
+    await restartedAdapter.waitForReconciliations(1);
     await restartedService.emitEvent({
       callerAgentId: active.request.agentId,
       event: "done",
@@ -729,6 +776,100 @@ describe("WorkflowService runtime", () => {
     const details = await restartedService.inspectRun(run.id);
     expect(details.events.filter((event) => event.type === "turn_started")).toHaveLength(1);
     expect(details.events.filter((event) => event.type === "event_accepted")).toHaveLength(1);
+  });
+
+  it("reconciles a native submission that crashed before onStarted persisted its turn ID", async () => {
+    const firstProcess = await setup(baseSpec());
+    firstProcess.adapter.pauseAfterNativeSubmission = true;
+    const run = await firstProcess.service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Submit exactly once" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await firstProcess.adapter.waitForStarts(1);
+    const submitted = firstProcess.adapter.starts[0];
+    const beforeRestart = await firstProcess.storage.readState(run.id);
+    expect(beforeRestart.instances).toMatchObject({
+      root: {
+        activeTurn: {
+          clientMessageId: submitted.request.clientMessageId,
+          phase: "launching",
+          agentId: submitted.request.agentId,
+          nativeTurnId: null,
+        },
+      },
+    });
+    firstProcess.service.dispose();
+
+    const restartedAdapter = new FakeRuntimeAdapter();
+    restartedAdapter.adopt(submitted.request, submitted.nativeTurnId);
+    const restartedService = new WorkflowService({
+      storage: firstProcess.storage,
+      adapter: restartedAdapter,
+    });
+    await restartedService.initialize();
+    await restartedAdapter.waitForReconciliations(1);
+    await restartedService.emitEvent({
+      callerAgentId: submitted.request.agentId,
+      event: "done",
+      message: "continued from the durable native request",
+      data: { value: "one side effect" },
+    });
+    restartedAdapter.complete(submitted.request.agentId);
+
+    await expect(restartedService.waitForRunTerminal(run.id)).resolves.toMatchObject({
+      status: "complete",
+      reason: "returned",
+    });
+    expect(firstProcess.adapter.starts).toHaveLength(1);
+    expect(restartedAdapter.starts).toHaveLength(0);
+    expect([...firstProcess.adapter.prompts, ...restartedAdapter.prompts]).toHaveLength(1);
+    expect([...firstProcess.adapter.externalEffects, ...restartedAdapter.externalEffects]).toEqual([
+      submitted.request.clientMessageId,
+    ]);
+    const details = await restartedService.inspectRun(run.id);
+    expect(details.events.filter((event) => event.type === "turn_started")).toHaveLength(1);
+    expect(details.events.filter((event) => event.type === "event_accepted")).toHaveLength(1);
+  });
+
+  it("preserves explicit null event data for schema validation and routing", async () => {
+    const spec = baseSpec();
+    const flows = spec.flows as JsonObject;
+    const main = flows.main as JsonObject;
+    const states = main.states as JsonObject;
+    const work = states.work as JsonObject;
+    const turn = work.turn as JsonObject;
+    const emits = turn.emits as JsonObject;
+    emits.done = {
+      description: "Complete with null data",
+      dataSchema: { type: "null" },
+    };
+    states.finish = { return: { output: "accepted explicit null" } };
+    const { service, adapter } = await setup(spec);
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Preserve null" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForStarts(1);
+    const active = adapter.starts[0];
+
+    await service.emitEvent({
+      callerAgentId: active.request.agentId,
+      event: "done",
+      message: "null is intentional",
+      data: null,
+    });
+    adapter.complete(active.request.agentId);
+
+    await expect(service.waitForRunTerminal(run.id)).resolves.toMatchObject({
+      status: "complete",
+    });
+    const details = await service.inspectRun(run.id);
+    expect(details.events.find((event) => event.type === "event_accepted")).toMatchObject({
+      event: "done",
+      data: null,
+    });
   });
 
   it("applies turn and runtime limits without blocking a terminal return", async () => {
