@@ -215,6 +215,22 @@ describe("workflow spec validation and materialization", () => {
     );
   });
 
+  it("matches parameter references only inside template expressions", () => {
+    const prose = baseSpec();
+    prose.description = "Documents parameters.timeout without referencing it.";
+    (prose.prompts as Record<string, unknown>).work =
+      "Treat parameters.timeout as ordinary prose outside template delimiters.";
+    expect(validateWorkflowTemplate(prose)).toMatchObject({ valid: true, issues: [] });
+
+    const expression = baseSpec();
+    (expression.prompts as Record<string, unknown>).work =
+      '{% if parameters.notDeclared == "yes" %}Run it.{% endif %}';
+    expect(validateWorkflowTemplate(expression).issues).toContainEqual({
+      path: "parameters.notDeclared",
+      message: "referenced but not declared",
+    });
+  });
+
   it("rejects unsupported prompt template tags before a run is saved", () => {
     const spec = baseSpec();
     (spec.prompts as Record<string, unknown>).work =
@@ -242,6 +258,35 @@ describe("workflow spec validation and materialization", () => {
     expect(result.issues).toContainEqual({
       path: `bindings.${field}`,
       message: "must be a non-empty string or null",
+    });
+  });
+
+  it.each(["", "   "])("rejects empty agent binding value %j", (value) => {
+    const spec = baseSpec();
+    (spec.bindings as Record<string, unknown>).agents = { worker: value };
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "bindings.agents.worker",
+      message: "must be a non-empty string or null",
+    });
+  });
+
+  it.each([
+    ["finish", "return"],
+    ["failed", "stop"],
+  ])("rejects unknown fields in a %s state", (stateName, action) => {
+    const spec = baseSpec();
+    const flows = spec.flows as Record<string, Record<string, unknown>>;
+    const states = flows.main.states as Record<string, Record<string, Record<string, unknown>>>;
+    states[stateName][action].status = "failed";
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: `flows.main.states.${stateName}.${action}.status`,
+      message: "unknown field",
     });
   });
 

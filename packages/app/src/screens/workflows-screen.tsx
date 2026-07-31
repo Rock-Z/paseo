@@ -289,13 +289,19 @@ function WorkflowHostScreen({
       const payload = await client.workflowSpecSave(parseEditor(editor));
       if (payload.error) throw new Error(payload.error);
       if (!payload.summary) throw new Error("The host did not return the saved workflow.");
+      if (selectedSpec?.id === payload.summary.id) {
+        selectedSpecRequestRef.current += 1;
+        setSelectedSpec(null);
+        setValidation(null);
+        setLaunchForm(EMPTY_FORM);
+      }
       setAction({ kind: "success", message: `Saved ${payload.summary.name}` });
       setEditorOpen(false);
       await load(true);
     } catch (error) {
       setAction({ kind: "error", message: errorMessage(error) });
     }
-  }, [client, editor, load]);
+  }, [client, editor, load, selectedSpec]);
 
   const inspect = useCallback(
     async (run: WorkflowRunSummary) => {

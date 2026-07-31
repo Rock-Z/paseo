@@ -53,6 +53,7 @@ const SLUG = /^[a-z0-9][a-z0-9-]*$/;
 const AGENT_NAME = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DURATION = /^[1-9][0-9]*(s|m|h|d)$/;
+const TEMPLATE_EXPRESSION = /{{([\s\S]*?)}}|{%([\s\S]*?)%}/g;
 const PARAMETER_REFERENCE = /parameters\.([A-Za-z_][A-Za-z0-9_]*)/g;
 const EXACT_PARAMETER_REFERENCE = /^\s*{{\s*parameters\.([A-Za-z_][A-Za-z0-9_]*)\s*}}\s*$/;
 const Ajv2020Constructor = Ajv2020 as unknown as {
@@ -249,7 +250,7 @@ function validateParameterReferences(
   issues: Issues,
 ): void {
   const found = new Set<string>();
-  collectParameterReferences(value, found, false);
+  collectParameterReferences(value, found);
   for (const name of [...found].sort()) {
     if (!parameters.has(name)) {
       issues.add(`parameters.${name}`, "referenced but not declared");
@@ -257,16 +258,18 @@ function validateParameterReferences(
   }
 }
 
-function collectParameterReferences(value: unknown, found: Set<string>, skip: boolean): void {
+function collectParameterReferences(value: unknown, found: Set<string>): void {
   if (typeof value === "string") {
-    for (const match of value.matchAll(PARAMETER_REFERENCE)) {
-      found.add(match[1]);
+    for (const expression of value.matchAll(TEMPLATE_EXPRESSION)) {
+      for (const match of (expression[1] ?? expression[2] ?? "").matchAll(PARAMETER_REFERENCE)) {
+        found.add(match[1]);
+      }
     }
     return;
   }
   if (Array.isArray(value)) {
     for (const item of value) {
-      collectParameterReferences(item, found, skip);
+      collectParameterReferences(item, found);
     }
     return;
   }
@@ -274,10 +277,10 @@ function collectParameterReferences(value: unknown, found: Set<string>, skip: bo
     return;
   }
   for (const [key, item] of Object.entries(value)) {
-    if (!skip && key === "parameters") {
+    if (key === "parameters") {
       continue;
     }
-    collectParameterReferences(item, found, skip);
+    collectParameterReferences(item, found);
   }
 }
 
@@ -322,8 +325,8 @@ function validateAgentBindings(
     if (!agents.has(name)) {
       issues.add(`bindings.agents.${name}`, "unknown agent");
     }
-    if (agentId !== null && (typeof agentId !== "string" || agentId.length === 0)) {
-      issues.add(`bindings.agents.${name}`, "must be a string or null");
+    if (agentId !== null && (typeof agentId !== "string" || !agentId.trim())) {
+      issues.add(`bindings.agents.${name}`, "must be a non-empty string or null");
     }
     if (agentId !== null && agents.get(name)?.persistence !== "reuse-agent") {
       issues.add(`agents.${name}.persistence`, "bound agents must use reuse-agent");
@@ -668,7 +671,12 @@ function validateReturnState(value: JsonObject, path: string, issues: Issues): v
   if (value.on !== undefined) {
     issues.add(`${path}.on`, "not allowed for return state");
   }
-  if (!issues.object(value.return, `${path}.return`) || !("output" in value.return)) {
+  if (!issues.object(value.return, `${path}.return`)) {
+    issues.add(`${path}.return.output`, "required");
+    return;
+  }
+  issues.unknown(value.return, `${path}.return`, new Set(["output"]));
+  if (!("output" in value.return)) {
     issues.add(`${path}.return.output`, "required");
   }
 }
@@ -677,11 +685,12 @@ function validateStopState(value: JsonObject, path: string, issues: Issues): voi
   if (value.on !== undefined) {
     issues.add(`${path}.on`, "not allowed for stop state");
   }
-  if (
-    !issues.object(value.stop, `${path}.stop`) ||
-    typeof value.stop.reason !== "string" ||
-    !value.stop.reason.trim()
-  ) {
+  if (!issues.object(value.stop, `${path}.stop`)) {
+    issues.add(`${path}.stop.reason`, "must be a non-empty string");
+    return;
+  }
+  issues.unknown(value.stop, `${path}.stop`, new Set(["reason"]));
+  if (typeof value.stop.reason !== "string" || !value.stop.reason.trim()) {
     issues.add(`${path}.stop.reason`, "must be a non-empty string");
   }
 }

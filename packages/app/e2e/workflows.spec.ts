@@ -189,11 +189,13 @@ test.describe("Native workflows", () => {
     try {
       const firstSpec = buildSingleTurnWorkflow({ name: firstName, delayMs: 0 });
       const secondSpec = buildSingleTurnWorkflow({ name: secondName, delayMs: 0 });
-      (firstSpec.parameters as Record<string, unknown>).shared = {
+      const firstParameters = firstSpec.parameters as Record<string, Record<string, unknown>>;
+      const secondParameters = secondSpec.parameters as Record<string, Record<string, unknown>>;
+      firstParameters.shared = {
         type: "string",
         default: "first default",
       };
-      (secondSpec.parameters as Record<string, unknown>).shared = {
+      secondParameters.shared = {
         type: "string",
         default: "second default",
       };
@@ -231,6 +233,18 @@ test.describe("Native workflows", () => {
       await page.getByTestId(`workflow-spec-${secondName}`).click();
       await expect(page.getByTestId("workflow-launch-form")).toContainText(`Launch ${secondName}`);
       await expect(sharedInput).toHaveValue("second default");
+
+      secondParameters.shared.default = "replacement default";
+      await page.getByTestId("workflows-new-json").click();
+      await page.getByLabel("Workflow JSON").fill(JSON.stringify(secondSpec));
+      await page.getByTestId("workflow-json-save").click();
+      await expect(page.getByTestId("workflows-action-success")).toContainText(
+        `Saved ${secondName}`,
+      );
+      await expect(page.getByTestId("workflow-launch-form")).toHaveCount(0);
+
+      await page.getByTestId(`workflow-spec-${secondName}`).click();
+      await expect(sharedInput).toHaveValue("replacement default");
     } finally {
       gate?.release();
       await page.goto("about:blank").catch(() => undefined);
