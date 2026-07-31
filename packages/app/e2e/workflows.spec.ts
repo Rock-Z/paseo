@@ -412,6 +412,58 @@ test.describe("Native workflows", () => {
     }
   });
 
+  test("locks the JSON editor while definition validation is pending", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-validation-lock-" });
+    const name = uniqueWorkflowName("validation-lock");
+    let validateRequests = 0;
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      gate = await delayWorkflowResponse(page, isWorkflowSpecValidateResponse, {
+        onClientMessage: (message) => {
+          if (isWorkflowSpecValidateRequest(message)) validateRequests += 1;
+        },
+      });
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByTestId("workflows-new-json")).toBeVisible({
+        timeout: 30_000,
+      });
+      await page.getByTestId("workflows-new-json").click();
+      const editor = page.getByLabel("Workflow JSON");
+      const validate = page.getByTestId("workflow-json-validate");
+      const save = page.getByTestId("workflow-json-save");
+      await editor.fill(JSON.stringify(buildSingleTurnWorkflow({ name, delayMs: 0 })));
+      await validate.evaluate((element) => {
+        const button = element as HTMLButtonElement;
+        button.click();
+        button.click();
+      });
+      await gate.waitForDelayedResponse();
+
+      await expect(editor).not.toBeEditable();
+      await expect(page.getByTestId("workflow-import-file")).toBeDisabled();
+      await expect(validate).toBeDisabled();
+      await expect(save).toBeDisabled();
+      await validate.dispatchEvent("click");
+      await flushBrowserFrames(page);
+      expect(validateRequests).toBe(1);
+
+      gate.release();
+      await expect(page.getByTestId("workflows-action-success")).toContainText(
+        "Workflow JSON is valid.",
+      );
+      await expect(editor).toBeEditable();
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
   test("submits one workflow run for a rapid double launch", async ({ page }) => {
     const workspace = await seedWorkspace({ repoPrefix: "workflow-launch-lock-" });
     const name = uniqueWorkflowName("launch-lock");
@@ -979,6 +1031,38 @@ function isWorkflowSpecSaveResponse(message: string | Buffer): boolean {
       message?: { type?: unknown };
     };
     return envelope.type === "session" && envelope.message?.type === "workflow.spec.save.response";
+  } catch {
+    return false;
+  }
+}
+
+function isWorkflowSpecValidateRequest(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return (
+      envelope.type === "session" && envelope.message?.type === "workflow.spec.validate.request"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isWorkflowSpecValidateResponse(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return (
+      envelope.type === "session" && envelope.message?.type === "workflow.spec.validate.response"
+    );
   } catch {
     return false;
   }

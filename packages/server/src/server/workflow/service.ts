@@ -546,29 +546,34 @@ export class WorkflowService {
     const instance = requireInstance(state, instanceId);
     const definition = stateDefinition(flowDefinition(spec, instance.flow), instance.state);
     if (isObject(definition.turn)) {
-      await this.prepareTurn(runId, instanceId, spec);
+      await this.prepareTurn(runId, instanceId, instance.state, spec);
       return;
     }
     if (isObject(definition.call)) {
-      await this.startCall(runId, instanceId, spec, definition);
+      await this.startCall(runId, instanceId, instance.state, spec, definition);
       return;
     }
     if (isObject(definition.map)) {
-      await this.startMap(runId, instanceId, spec, definition);
+      await this.startMap(runId, instanceId, instance.state, spec, definition);
       return;
     }
     if (isObject(definition.return)) {
-      await this.returnInstance(runId, instanceId, spec, definition);
+      await this.returnInstance(runId, instanceId, instance.state, spec, definition);
       return;
     }
-    await this.stopFromState(runId, instanceId, spec, definition);
+    await this.stopFromState(runId, instanceId, instance.state, spec, definition);
   }
 
-  private async prepareTurn(runId: string, instanceId: string, spec: JsonObject): Promise<void> {
+  private async prepareTurn(
+    runId: string,
+    instanceId: string,
+    expectedState: string,
+    spec: JsonObject,
+  ): Promise<void> {
     let prepared: WorkflowActiveTurn | null = null;
     await this.transact(runId, async (tx) => {
-      const instance = requireInstance(tx.state, instanceId);
-      if (instance.status !== "runnable") return;
+      const instance = selectedRunnableInstance(tx, instanceId, expectedState);
+      if (!instance) return;
       const definition = stateDefinition(flowDefinition(spec, instance.flow), instance.state);
       const turn = objectField(definition, "turn");
       const role = String(turn.agent);
@@ -926,12 +931,13 @@ export class WorkflowService {
   private async startCall(
     runId: string,
     instanceId: string,
+    expectedState: string,
     spec: JsonObject,
     definition: JsonObject,
   ): Promise<void> {
     await this.transact(runId, (tx) => {
-      const parent = requireInstance(tx.state, instanceId);
-      if (parent.status !== "runnable") return;
+      const parent = selectedRunnableInstance(tx, instanceId, expectedState);
+      if (!parent) return;
       const call = objectField(definition, "call");
       const child = spawnChild(tx.state, spec, parent, call, {
         kind: "call",
@@ -952,12 +958,13 @@ export class WorkflowService {
   private async startMap(
     runId: string,
     instanceId: string,
+    expectedState: string,
     spec: JsonObject,
     definition: JsonObject,
   ): Promise<void> {
     await this.transact(runId, (tx) => {
-      const parent = requireInstance(tx.state, instanceId);
-      if (parent.status !== "runnable") return;
+      const parent = selectedRunnableInstance(tx, instanceId, expectedState);
+      if (!parent) return;
       const action = objectField(definition, "map");
       const items = renderValue(action.items, buildContext(spec, tx.state, parent));
       if (!Array.isArray(items)) throw new Error("map.items must render to an array");
@@ -994,11 +1001,13 @@ export class WorkflowService {
   private async returnInstance(
     runId: string,
     instanceId: string,
+    expectedState: string,
     spec: JsonObject,
     definition: JsonObject,
   ): Promise<void> {
     await this.transact(runId, (tx) => {
-      const instance = requireInstance(tx.state, instanceId);
+      const instance = selectedRunnableInstance(tx, instanceId, expectedState);
+      if (!instance) return;
       const action = objectField(definition, "return");
       instance.result = renderValue(action.output, buildContext(spec, tx.state, instance));
       instance.status = "returned";
@@ -1021,11 +1030,13 @@ export class WorkflowService {
   private async stopFromState(
     runId: string,
     instanceId: string,
+    expectedState: string,
     spec: JsonObject,
     definition: JsonObject,
   ): Promise<void> {
     await this.transact(runId, (tx) => {
-      const instance = requireInstance(tx.state, instanceId);
+      const instance = selectedRunnableInstance(tx, instanceId, expectedState);
+      if (!instance) return;
       const stop = objectField(definition, "stop");
       const reason = String(renderValue(stop.reason, buildContext(spec, tx.state, instance)));
       instance.status = "complete";
@@ -1561,6 +1572,17 @@ function parseState(value: JsonObject): WorkflowRunState {
 function requireInstance(state: WorkflowRunState, id: string): WorkflowInstance {
   const instance = state.instances[id];
   if (!instance) throw new Error(`workflow instance not found: ${id}`);
+  return instance;
+}
+
+function selectedRunnableInstance(
+  tx: Transaction,
+  instanceId: string,
+  expectedState: string,
+): WorkflowInstance | null {
+  if (tx.state.status !== "running" || tx.state.stopRequested) return null;
+  const instance = requireInstance(tx.state, instanceId);
+  if (instance.status !== "runnable" || instance.state !== expectedState) return null;
   return instance;
 }
 

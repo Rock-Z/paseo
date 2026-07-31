@@ -472,6 +472,54 @@ function baseSpec(): JsonObject {
   };
 }
 
+function actionBoundarySpec(action: "turn" | "call" | "map" | "return" | "stop"): JsonObject {
+  const spec = baseSpec();
+  if (action === "turn") return spec;
+  const flows = spec.flows as JsonObject;
+  const main = flows.main as JsonObject;
+  if (action === "return") {
+    main.initial = "finish";
+    main.states = { finish: { return: { output: "finished" } } };
+    return spec;
+  }
+  if (action === "stop") {
+    main.initial = "finish";
+    main.states = { finish: { stop: { reason: "workflow stop" } } };
+    return spec;
+  }
+  flows.child = {
+    initial: "finish",
+    inputs: { value: "" },
+    states: { finish: { return: { output: "{{ inputs.value }}" } } },
+  };
+  if (action === "map") spec.inputs = { items: ["one"] };
+  main.initial = "dispatch";
+  main.states =
+    action === "call"
+      ? {
+          dispatch: {
+            call: { flow: "child", with: { value: "one" } },
+            on: { returned: "finish" },
+          },
+          finish: { return: { output: "{{ event.data }}" } },
+        }
+      : {
+          dispatch: {
+            map: {
+              group: "items",
+              items: "{{ inputs.items }}",
+              as: "item",
+              call: { flow: "child", with: { value: "{{ item }}" } },
+              join: "all",
+              concurrency: 1,
+            },
+            on: { joined: "finish" },
+          },
+          finish: { return: { output: "{{ event.data.results }}" } },
+        };
+  return spec;
+}
+
 function twoTurnSpec(persistence: "reuse-agent" | "fresh-agent"): JsonObject {
   const spec = baseSpec();
   const agents = spec.agents as JsonObject;
@@ -620,6 +668,58 @@ describe("WorkflowService runtime", () => {
     expect(details.run).toMatchObject({ status: "stopped", reason: "requested" });
     expect(details.events.filter((event) => event.type === "workspace_ready")).toHaveLength(0);
   });
+
+  it.each(["turn", "call", "map", "return", "stop"] as const)(
+    "does not execute a selected %s action after a user stop commits",
+    async (action) => {
+      const { service, storage, adapter } = await setup(
+        actionBoundarySpec(action),
+        (options) => new ReadHookWorkflowStorage(options),
+      );
+      let releaseValidation!: () => void;
+      adapter.validateGate = new Promise<void>((resolve) => {
+        releaseValidation = resolve;
+      });
+      const run = await service.startRun({
+        workflowId: "runtime-fixture",
+        parameters: { objective: `Stop selected ${action}` },
+        context: { workspaceId: "workspace-root" },
+      });
+      await adapter.waitForValidations(1);
+
+      let runnableReads = 0;
+      let resolveStopped!: () => void;
+      const stopped = new Promise<void>((resolve) => {
+        resolveStopped = resolve;
+      });
+      storage.armReadHook(
+        (state) => {
+          const root = (state.instances as JsonObject).root as JsonObject;
+          if (state.status !== "running" || root.status !== "runnable") return false;
+          runnableReads += 1;
+          return runnableReads === 5;
+        },
+        async () => {
+          await service.stopRun(run.id);
+          resolveStopped();
+        },
+      );
+      releaseValidation();
+      await stopped;
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+      const details = await service.inspectRun(run.id);
+      expect(details.run).toMatchObject({ status: "stopped", reason: "requested" });
+      expect(details.state.instances).toMatchObject({
+        root: { status: "runnable", activeTurn: null },
+      });
+      expect(Object.keys(details.state.instances as JsonObject)).toEqual(["root"]);
+      expect(details.prompts).toHaveLength(0);
+      expect(adapter.agentCreates).toHaveLength(0);
+      expect(adapter.starts).toHaveLength(0);
+      service.dispose();
+    },
+  );
 
   it("records root workspace provisioning before a user stop becomes terminal", async () => {
     const spec = baseSpec();

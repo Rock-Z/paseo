@@ -131,7 +131,9 @@ function WorkflowHostScreen({
   const [editorOpen, setEditorOpen] = useState(false);
   const [editor, setEditor] = useState("");
   const [editorSavePending, setEditorSavePending] = useState(false);
+  const [editorValidationPending, setEditorValidationPending] = useState(false);
   const editorSavePendingRef = useRef(false);
+  const editorValidationPendingRef = useRef(false);
   const launchPendingRef = useRef(false);
   const runMutationPendingRef = useRef(false);
   const loadRequestRef = useRef(0);
@@ -303,7 +305,9 @@ function WorkflowHostScreen({
   }, [client, context, launchForm, load, refreshDetails, selectedSpec, validation]);
 
   const validateEditor = useCallback(async () => {
-    if (!client) return;
+    if (!client || editorSavePendingRef.current || editorValidationPendingRef.current) return;
+    editorValidationPendingRef.current = true;
+    setEditorValidationPending(true);
     setAction({ kind: "pending", message: "Validating JSON workflow…" });
     try {
       const spec = parseEditor(editor);
@@ -319,11 +323,14 @@ function WorkflowHostScreen({
       setAction({ kind: "success", message: "Workflow JSON is valid." });
     } catch (error) {
       setAction({ kind: "error", message: errorMessage(error) });
+    } finally {
+      editorValidationPendingRef.current = false;
+      setEditorValidationPending(false);
     }
   }, [client, editor]);
 
   const saveEditor = useCallback(async () => {
-    if (!client || editorSavePendingRef.current) return;
+    if (!client || editorSavePendingRef.current || editorValidationPendingRef.current) return;
     editorSavePendingRef.current = true;
     setEditorSavePending(true);
     setAction({ kind: "pending", message: "Saving workflow definition…" });
@@ -473,7 +480,7 @@ function WorkflowHostScreen({
                 onChange={setEditor}
                 onValidate={validateEditor}
                 onSave={saveEditor}
-                pending={editorSavePending}
+                pending={editorSavePending || editorValidationPending}
               />
             ) : null}
             <View style={styles.list}>
