@@ -236,6 +236,16 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
       this.resumedNativeTurns.set(input.agentId, input.nativeTurnId);
     }
     let agent = await this.loadAgent(input.agentId);
+    const durable = await this.findHistoricalTurnResult(
+      input.agentId,
+      input.nativeTurnId,
+      input.clientMessageId,
+      true,
+    );
+    if (durable) {
+      this.clearResumedTurn(input.agentId, input.nativeTurnId);
+      return { state: "completed", result: durable };
+    }
     if (input.nativeTurnId) {
       await this.waitForResumedTurn(input.agentId, input.clientMessageId);
     }
@@ -475,6 +485,7 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     agentId: string,
     nativeTurnId: string | null,
     clientMessageId: string,
+    receiptOnly = false,
   ): Promise<WorkflowTurnResult | null> {
     const agent = this.agentManager.getAgent(agentId);
     const receipt = agent?.recentTurnReceipts?.findLast(
@@ -482,6 +493,7 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
         candidate.clientMessageId === clientMessageId &&
         (!nativeTurnId || candidate.turnId === nativeTurnId),
     );
+    if (receiptOnly && !receipt) return null;
     const rows = await this.agentManager.getTimelineRows(agentId);
     const start = rows.findLastIndex(
       (row) => row.item.type === "user_message" && row.item.clientMessageId === clientMessageId,

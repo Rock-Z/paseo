@@ -5,6 +5,27 @@ const INLINE_VALUE = /{{\s*([A-Za-z_][A-Za-z0-9_.]*)\s*(?:\|\s*trim\s*)?}}/g;
 const IF_BLOCK =
   /{%\s*if\s+([A-Za-z_][A-Za-z0-9_.]*)\s*==\s*(["'])(.*?)\2\s*%}([\s\S]*?){%\s*endif\s*%}/g;
 const ANY_TAG = /{%\s*([^%]+?)\s*%}/;
+const ALL_TAGS = /{%\s*([^%]+?)\s*%}/g;
+const IF_TAG = /^if\s+[A-Za-z_][A-Za-z0-9_.]*\s*==\s*(["']).*?\1$/;
+
+export function promptTemplateIssue(template: string): string | null {
+  let open = false;
+  for (const match of template.matchAll(ALL_TAGS)) {
+    const tag = match[1].trim();
+    if (IF_TAG.test(tag)) {
+      if (open) return "has an unsupported nested if block";
+      open = true;
+      continue;
+    }
+    if (tag === "endif") {
+      if (!open) return "has an unbalanced if block";
+      open = false;
+      continue;
+    }
+    return `has unsupported template tag: ${tag}`;
+  }
+  return open ? "has an unbalanced if block" : null;
+}
 
 export function renderPrompt(template: string, context: JsonObject): string {
   let rendered = template;

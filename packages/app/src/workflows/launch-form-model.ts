@@ -43,15 +43,18 @@ export function submitWorkflowLaunchForm(
       }
       continue;
     }
-    const raw = value?.trim() ?? "";
-    if (!raw) {
+    const raw = value ?? "";
+    if (!raw.trim()) {
       if (declaration.required && declaration.defaultFrom === undefined) {
         errors[declaration.name] = "Required";
       }
       continue;
     }
     try {
-      parameters[declaration.name] = parseParameterValue(raw, declaration);
+      const parsedRaw = ["string", "path", "image", "enum"].includes(declaration.type)
+        ? raw
+        : raw.trim();
+      parameters[declaration.name] = parseParameterValue(parsedRaw, declaration);
     } catch (error) {
       errors[declaration.name] = error instanceof Error ? error.message : String(error);
     }

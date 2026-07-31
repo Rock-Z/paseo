@@ -45,6 +45,57 @@ describe("workflow launch form model", () => {
     });
   });
 
+  it("preserves whitespace in string-like parameter values", () => {
+    const whitespaceValidation: WorkflowValidationResult = {
+      valid: true,
+      issues: [],
+      summary: null,
+      parameters: [
+        {
+          name: "text",
+          type: "string",
+          description: "Whitespace-sensitive text",
+          required: true,
+          defaultValue: " padded text ",
+        },
+        {
+          name: "path",
+          type: "path",
+          description: "Whitespace-sensitive path",
+          required: true,
+          defaultValue: " /repo/path ",
+        },
+        {
+          name: "image",
+          type: "image",
+          description: "Whitespace-sensitive image",
+          required: true,
+          defaultValue: " image-ref ",
+        },
+        {
+          name: "choice",
+          type: "enum",
+          description: "Whitespace-sensitive choice",
+          required: true,
+          defaultValue: " padded choice ",
+          values: [" padded choice ", "other"],
+        },
+      ],
+    };
+
+    expect(
+      submitWorkflowLaunchForm(openWorkflowLaunchForm(whitespaceValidation), whitespaceValidation),
+    ).toEqual({
+      ok: true,
+      parameters: {
+        text: " padded text ",
+        path: " /repo/path ",
+        image: " image-ref ",
+        choice: " padded choice ",
+      },
+    });
+  });
+
   it("submits explicit null for optional caller bindings", () => {
     const bindingValidation: WorkflowValidationResult = {
       valid: true,

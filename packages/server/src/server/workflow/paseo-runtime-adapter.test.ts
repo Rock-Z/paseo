@@ -51,6 +51,65 @@ describe("PaseoWorkflowRuntimeAdapter", () => {
     });
   });
 
+  it("uses a durable historical receipt before waiting on unrelated busy work", async () => {
+    const agent = {
+      id: "agent-shared",
+      activeForegroundTurnId: "native-new",
+      lifecycle: "running",
+      recentTurnReceipts: [
+        {
+          turnId: "native-workflow",
+          clientMessageId: "client-workflow",
+          status: "completed",
+          error: null,
+        },
+      ],
+    };
+    const subscribe = vi.fn(() => {
+      throw new Error("waited on unrelated busy work");
+    });
+    const adapter = new PaseoWorkflowRuntimeAdapter({
+      agentManager: {
+        getAgent: vi.fn(() => agent),
+        getActiveForegroundClientMessageId: vi.fn(() => "client-new"),
+        getTimelineRows: vi.fn(async () => [
+          {
+            item: {
+              type: "user_message",
+              clientMessageId: "client-workflow",
+            },
+          },
+        ]),
+        subscribe,
+        hasInFlightRun: vi.fn(() => true),
+      } as never,
+      agentStorage: {} as never,
+      providerSnapshotManager: {} as never,
+      workspaceRegistry: {} as never,
+      createAgent: (() => undefined) as never,
+      createPaseoWorktree: (() => undefined) as never,
+      logger: {} as never,
+    });
+
+    await expect(
+      adapter.reconcileTurn({
+        agentId: agent.id,
+        nativeTurnId: "native-workflow",
+        clientMessageId: "client-workflow",
+      }),
+    ).resolves.toEqual({
+      state: "completed",
+      result: {
+        agentId: agent.id,
+        nativeTurnId: "native-workflow",
+        status: "completed",
+        lastMessage: "",
+        lastError: null,
+      },
+    });
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
   it("does not adopt an unrelated foreground turn without matching client identity", async () => {
     const agent = {
       id: "agent-shared",

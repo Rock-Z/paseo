@@ -5,7 +5,7 @@ import type {
   WorkflowValidationResult,
 } from "@getpaseo/protocol/workflow/types";
 import { canonicalJson, type JsonObject } from "./json.js";
-import { renderValue } from "./render.js";
+import { promptTemplateIssue, renderValue } from "./render.js";
 
 export { canonicalJson, type JsonObject } from "./json.js";
 
@@ -299,8 +299,9 @@ function validateBindings(
     issues.add("bindings", "workspace and worktree must be supplied together");
   }
   for (const key of ["workspace", "worktree"] as const) {
-    if (value[key] !== undefined && value[key] !== null && typeof value[key] !== "string") {
-      issues.add(`bindings.${key}`, "must be a string or null");
+    if (value[key] === undefined || value[key] === null) continue;
+    if (typeof value[key] !== "string" || !value[key].trim()) {
+      issues.add(`bindings.${key}`, "must be a non-empty string or null");
     }
   }
   if (value.agents === undefined || value.agents === null) {
@@ -463,11 +464,8 @@ function validatePrompts(value: unknown, issues: Issues): void {
       issues.add(`prompts.${name}`, "must be a string");
       continue;
     }
-    const opens = [...prompt.matchAll(/{%\s*if\b/g)].length;
-    const closes = [...prompt.matchAll(/{%\s*endif\s*%}/g)].length;
-    if (opens !== closes) {
-      issues.add(`prompts.${name}`, "has an unbalanced if block");
-    }
+    const issue = promptTemplateIssue(prompt);
+    if (issue) issues.add(`prompts.${name}`, issue);
   }
 }
 

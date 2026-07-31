@@ -215,6 +215,36 @@ describe("workflow spec validation and materialization", () => {
     );
   });
 
+  it("rejects unsupported prompt template tags before a run is saved", () => {
+    const spec = baseSpec();
+    (spec.prompts as Record<string, unknown>).work =
+      "{% for item in inputs %}{{ item }}{% endfor %}";
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "prompts.work",
+      message: "has unsupported template tag: for item in inputs",
+    });
+  });
+
+  it.each([
+    ["workspace", ""],
+    ["workspace", "   "],
+    ["worktree", ""],
+    ["worktree", "   "],
+  ])("rejects empty %s binding value %j", (field, value) => {
+    const spec = baseSpec();
+    (spec.bindings as Record<string, unknown>)[field] = value;
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: `bindings.${field}`,
+      message: "must be a non-empty string or null",
+    });
+  });
+
   it("rejects invalid native agent setting value types", () => {
     const spec = baseSpec();
     const agents = spec.agents as Record<string, Record<string, Record<string, unknown>>>;
