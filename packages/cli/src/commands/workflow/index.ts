@@ -1,5 +1,9 @@
 import { readFile } from "node:fs/promises";
-import type { WorkflowRunSummary, WorkflowSpecSummary } from "@getpaseo/protocol/workflow/types";
+import type {
+  WorkflowRunSummary,
+  WorkflowSpecSummary,
+  WorkflowValidationResult,
+} from "@getpaseo/protocol/workflow/types";
 import { Command } from "commander";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { withOutput } from "../../output/index.js";
@@ -136,6 +140,7 @@ async function validateSpec(
   const spec = await readJsonObject(file);
   return withClient(options, async (client) => {
     const payload = requirePayload(await client.workflowSpecValidate(spec));
+    assertValidWorkflowSpec(payload.validation);
     return {
       type: "single",
       data: payload.validation,
@@ -272,6 +277,15 @@ export function assertWorkflowSupport(client: WorkflowFeatureClient): void {
   throw {
     code: "DAEMON_UPDATE_REQUIRED",
     message: "Update the host to use native workflows.",
+  } satisfies CommandError;
+}
+
+export function assertValidWorkflowSpec(validation: WorkflowValidationResult): void {
+  if (validation.valid) return;
+  throw {
+    code: "INVALID_WORKFLOW_SPEC",
+    message: "Workflow spec is invalid.",
+    details: validation.issues.map((issue) => `${issue.path}: ${issue.message}`).join("\n"),
   } satisfies CommandError;
 }
 

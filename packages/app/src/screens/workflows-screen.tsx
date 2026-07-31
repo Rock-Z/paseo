@@ -87,7 +87,7 @@ export function WorkflowsScreen(): ReactElement {
       </View>
     );
   } else {
-    content = <WorkflowHostScreen serverId={selectedHost} context={context} />;
+    content = <WorkflowHostScreen key={selectedHost} serverId={selectedHost} context={context} />;
   }
 
   return (

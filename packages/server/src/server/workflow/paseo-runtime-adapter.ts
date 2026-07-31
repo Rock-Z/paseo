@@ -76,7 +76,10 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     const stats = await stat(cwd);
     if (!stats.isDirectory()) throw new Error(`workflow cwd is not a directory: ${cwd}`);
     const agents = objectValue(spec.agents, "agents");
+    const bindings = isObject(spec.bindings) ? spec.bindings : {};
+    const boundAgents = isObject(bindings.agents) ? bindings.agents : {};
     for (const [role, rawDeclaration] of Object.entries(agents)) {
+      if (typeof boundAgents[role] === "string") continue;
       const declaration = objectValue(rawDeclaration, `agents.${role}`);
       const create = objectValue(declaration.createAgent, `agents.${role}.createAgent`);
       await this.validateAgentCreate(create, cwd, `agents.${role}.createAgent`);
@@ -280,6 +283,10 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
       this.resumedNativeTurns.get(agentId) ??
       null
     );
+  }
+
+  getActiveTurnClientMessageId(agentId: string): string | null {
+    return this.agentManager.getActiveForegroundClientMessageId(agentId);
   }
 
   private async validateAgentCreate(create: JsonObject, cwd: string, path: string): Promise<void> {

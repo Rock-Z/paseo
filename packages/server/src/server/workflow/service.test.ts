@@ -140,6 +140,10 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     return this.active.get(agentId)?.nativeTurnId ?? null;
   }
 
+  getActiveTurnClientMessageId(agentId: string): string | null {
+    return this.active.get(agentId)?.request.clientMessageId ?? null;
+  }
+
   async waitForStarts(count: number): Promise<void> {
     if (this.starts.length >= count) return;
     await new Promise<void>((resolve) => this.waiters.push(resolve));
@@ -183,6 +187,12 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     const pending = this.active.get(agentId);
     if (!pending) throw new Error(`no active turn for ${agentId}`);
     pending.nativeTurnId = nativeTurnId;
+  }
+
+  replaceActiveClientMessageId(agentId: string, clientMessageId: string): void {
+    const pending = this.active.get(agentId);
+    if (!pending) throw new Error(`no active turn for ${agentId}`);
+    pending.request.clientMessageId = clientMessageId;
   }
 
   private flushWaiters(): void {
@@ -391,6 +401,96 @@ describe("WorkflowService runtime", () => {
     await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
       status: "complete",
     });
+  });
+
+  it("routes a shared agent event to its foreground native turn while another run waits", async () => {
+    const spec = baseSpec();
+    (spec.parameters as JsonObject).workerThreadRef = {
+      type: "string",
+      required: true,
+      defaultFrom: "current.agent",
+    };
+    (spec.bindings as JsonObject).agents = {
+      worker: "{{ parameters.workerThreadRef }}",
+    };
+    const { service, storage, adapter } = await setup(spec);
+    const context = { workspaceId: "workspace-root", agentId: "agent-shared" };
+    const first = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Finish the foreground run" },
+      context,
+    });
+    await adapter.waitForStarts(1);
+    await waitForActiveTurnPhase(storage, first.id, "running");
+
+    let releaseWaitingRun!: () => void;
+    adapter.idleGate = new Promise<void>((resolve) => {
+      releaseWaitingRun = resolve;
+    });
+    const second = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Wait for the shared agent" },
+      context,
+    });
+    await adapter.waitForIdleWaits(2);
+    await waitForActiveTurnPhase(storage, second.id, "queued");
+
+    await service.emitEvent({
+      callerAgentId: "agent-shared",
+      event: "done",
+      message: "the foreground turn finished",
+      data: { value: "first" },
+    });
+    expect((await service.inspectRun(first.id)).events).toContainEqual(
+      expect.objectContaining({ type: "event_accepted", event: "done" }),
+    );
+    expect((await service.inspectRun(second.id)).events).not.toContainEqual(
+      expect.objectContaining({ type: "event_accepted" }),
+    );
+    adapter.complete("agent-shared");
+    await expect(waitForRunTerminal(service, first.id)).resolves.toMatchObject({
+      status: "complete",
+    });
+
+    releaseWaitingRun();
+    await adapter.waitForStarts(2);
+    await service.emitEvent({
+      callerAgentId: "agent-shared",
+      event: "done",
+      message: "the waiting run continued",
+      data: { value: "second" },
+    });
+    adapter.complete("agent-shared");
+    await expect(waitForRunTerminal(service, second.id)).resolves.toMatchObject({
+      status: "complete",
+    });
+  });
+
+  it("does not authorize a launching workflow from an unrelated native client message", async () => {
+    const { service, storage, adapter } = await setup(baseSpec());
+    adapter.pauseAfterNativeSubmission = true;
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Authorize the exact native request" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForStarts(1);
+    await waitForActiveTurnPhase(storage, run.id, "launching");
+    const turn = adapter.starts[0];
+    adapter.replaceActiveClientMessageId(turn.request.agentId, "unrelated-client-message");
+
+    await expect(
+      service.emitEvent({
+        callerAgentId: turn.request.agentId,
+        event: "done",
+        message: "from another native turn",
+        data: { value: "wrong" },
+      }),
+    ).rejects.toThrow("does not own the active native turn");
+    expect((await service.inspectRun(run.id)).events).not.toContainEqual(
+      expect.objectContaining({ type: "event_accepted" }),
+    );
+    service.dispose();
   });
 
   it("does not submit a queued native turn after stop is acknowledged", async () => {

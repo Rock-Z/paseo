@@ -77,4 +77,5 @@ export interface WorkflowRuntimeAdapter {
     clientMessageId: string;
   }): Promise<WorkflowTurnReconciliation>;
   getActiveTurnId(agentId: string): string | null;
+  getActiveTurnClientMessageId(agentId: string): string | null;
 }

@@ -250,23 +250,45 @@ export class WorkflowService {
 
   async emitEvent(input: EmitWorkflowEventInput): Promise<void> {
     this.requireInitialized();
+    const foregroundNativeTurnId = this.adapter.getActiveTurnId(input.callerAgentId);
+    const foregroundClientMessageId = this.adapter.getActiveTurnClientMessageId(
+      input.callerAgentId,
+    );
     const candidates = (await this.storage.listRuns()).filter(
       (run) =>
         !run.legacy &&
         ["running", "stopping"].includes(run.status) &&
         run.agentIds.includes(input.callerAgentId),
     );
-    const matches: string[] = [];
+    const exactMatches: string[] = [];
+    const launchingMatches: string[] = [];
+    let hasWorkflowTurn = false;
     for (const candidate of candidates) {
       const state = parseState(await this.storage.readState(candidate.id));
-      if (findActiveTurnForAgent(state, input.callerAgentId)) matches.push(candidate.id);
+      const active = findActiveTurnForAgent(state, input.callerAgentId);
+      if (!active) continue;
+      hasWorkflowTurn = true;
+      if (!foregroundNativeTurnId) continue;
+      if (active.turn.nativeTurnId === foregroundNativeTurnId) {
+        exactMatches.push(candidate.id);
+      } else if (
+        active.turn.phase === "launching" &&
+        !active.turn.nativeTurnId &&
+        active.turn.clientMessageId === foregroundClientMessageId
+      ) {
+        launchingMatches.push(candidate.id);
+      }
     }
-    if (matches.length !== 1) {
+    const matches = exactMatches.length > 0 ? exactMatches : launchingMatches;
+    if (matches.length === 0) {
       throw new Error(
-        matches.length === 0
-          ? `caller ${input.callerAgentId} is not an active workflow turn`
-          : `caller ${input.callerAgentId} matches multiple active workflow turns`,
+        hasWorkflowTurn
+          ? "workflow event caller does not own the active native turn"
+          : `caller ${input.callerAgentId} is not an active workflow turn`,
       );
+    }
+    if (matches.length > 1) {
+      throw new Error(`caller ${input.callerAgentId} matches multiple active workflow turns`);
     }
     const runId = matches[0];
     await this.getRunSpec(runId);

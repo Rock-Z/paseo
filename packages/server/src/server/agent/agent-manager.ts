@@ -751,6 +751,13 @@ export class AgentManager {
     );
   }
 
+  getActiveForegroundClientMessageId(agentId: string): string | null {
+    const agent = this.agents.get(agentId);
+    const run = this.runs.getPendingRun(agentId);
+    if (!agent?.activeForegroundTurnId || run?.turnId !== agent.activeForegroundTurnId) return null;
+    return run.clientMessageId;
+  }
+
   subscribe(callback: AgentSubscriber, options?: SubscribeOptions): () => void {
     const targetAgentId =
       options?.agentId == null ? null : validateAgentId(options.agentId, "subscribe");
@@ -1979,7 +1986,7 @@ export class AgentManager {
     const isReplacement = agent.pendingReplacement;
     agent.lastError = undefined;
 
-    const pendingRun = this.runs.createPendingRun(agentId);
+    const pendingRun = this.runs.createPendingRun(agentId, options?.clientMessageId ?? null);
 
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string;

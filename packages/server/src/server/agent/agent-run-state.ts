@@ -14,6 +14,7 @@ export interface PendingForegroundRun {
   token: string;
   kind: "foreground";
   turnId: string | null;
+  clientMessageId: string | null;
   started: boolean;
   settled: boolean;
   settledPromise: Promise<void>;
@@ -40,8 +41,8 @@ export interface ForegroundRunAgentState {
 export class AgentRunState {
   private readonly runs = new Map<string, TrackedAgentRun>();
 
-  createPendingRun(agentId: string): PendingForegroundRun {
-    const pendingRun = createPendingForegroundRun();
+  createPendingRun(agentId: string, clientMessageId: string | null = null): PendingForegroundRun {
+    const pendingRun = createPendingForegroundRun(clientMessageId);
     this.runs.set(agentId, pendingRun);
     return pendingRun;
   }
@@ -258,13 +259,14 @@ export class ForegroundTurnStream {
   }
 }
 
-function createPendingForegroundRun(): PendingForegroundRun {
-  return createTrackedRun({ kind: "foreground", turnId: null, started: false });
+function createPendingForegroundRun(clientMessageId: string | null): PendingForegroundRun {
+  return createTrackedRun({ kind: "foreground", turnId: null, clientMessageId, started: false });
 }
 
 function createTrackedRun(input: {
   kind: "foreground";
   turnId: null;
+  clientMessageId: string | null;
   started: false;
 }): PendingForegroundRun;
 function createTrackedRun(input: {
@@ -274,7 +276,7 @@ function createTrackedRun(input: {
 }): AutonomousAgentRun;
 function createTrackedRun(
   input:
-    | { kind: "foreground"; turnId: null; started: false }
+    | { kind: "foreground"; turnId: null; clientMessageId: string | null; started: false }
     | { kind: "autonomous"; turnId: string | null; started: true },
 ): TrackedAgentRun {
   let resolveSettled!: () => void;
