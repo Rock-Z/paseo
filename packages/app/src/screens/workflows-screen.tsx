@@ -132,6 +132,7 @@ function WorkflowHostScreen({
   const [editor, setEditor] = useState("");
   const [editorSavePending, setEditorSavePending] = useState(false);
   const editorSavePendingRef = useRef(false);
+  const launchPendingRef = useRef(false);
   const loadRequestRef = useRef(0);
   const selectedRunIdRef = useRef<string | null>(null);
   const detailsRequestRef = useRef(0);
@@ -260,12 +261,13 @@ function WorkflowHostScreen({
   );
 
   const launch = useCallback(async () => {
-    if (!client || !selectedSpec || !validation) return;
+    if (!client || !selectedSpec || !validation || launchPendingRef.current) return;
     const submitted = submitWorkflowLaunchForm(launchForm, validation);
     if (!submitted.ok) {
       setLaunchForm(submitted.form);
       return;
     }
+    launchPendingRef.current = true;
     setAction({ kind: "pending", message: `Queueing ${selectedSpec.name}…` });
     try {
       const payload = await client.workflowRunStart({
@@ -284,6 +286,8 @@ function WorkflowHostScreen({
       await refreshDetails(payload.run.id);
     } catch (error) {
       setAction({ kind: "error", message: errorMessage(error) });
+    } finally {
+      launchPendingRef.current = false;
     }
   }, [client, context, launchForm, load, refreshDetails, selectedSpec, validation]);
 

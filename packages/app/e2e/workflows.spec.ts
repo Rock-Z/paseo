@@ -333,7 +333,11 @@ test.describe("Native workflows", () => {
       const editor = page.getByLabel("Workflow JSON");
       const save = page.getByTestId("workflow-json-save");
       await editor.fill(JSON.stringify(buildSingleTurnWorkflow({ name, delayMs: 0 })));
-      await save.click();
+      await save.evaluate((element) => {
+        const button = element as HTMLButtonElement;
+        button.click();
+        button.click();
+      });
       await gate.waitForDelayedResponse();
 
       await expect(editor).not.toBeEditable();
@@ -347,6 +351,53 @@ test.describe("Native workflows", () => {
       gate.release();
       await expect(page.getByTestId("workflows-action-success")).toContainText(`Saved ${name}`);
       await expect(page.getByTestId(`workflow-spec-${name}`)).toBeVisible();
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("submits one workflow run for a rapid double launch", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-launch-lock-" });
+    const name = uniqueWorkflowName("launch-lock");
+    let startResponses = 0;
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 0 }));
+      gate = await delayWorkflowResponse(page, isWorkflowRunStartResponse, {
+        onServerMessage: (message) => {
+          if (isWorkflowRunStartResponse(message)) startResponses += 1;
+        },
+      });
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByTestId(`workflow-spec-${name}`)).toBeVisible({
+        timeout: 30_000,
+      });
+      await page.getByTestId(`workflow-spec-${name}`).click();
+      const launch = page.getByTestId("workflow-launch-submit");
+      await expect(launch).toBeEnabled();
+      await launch.evaluate((element) => {
+        const button = element as HTMLButtonElement;
+        button.click();
+        button.click();
+      });
+      await gate.waitForDelayedResponse();
+
+      await expect(launch).toBeDisabled();
+      expect(startResponses).toBe(1);
+      gate.release();
+      await expect(page.getByTestId("workflows-action-success")).toContainText("Queued wfr_");
+      const runId = await findRunId(workspace.client, name);
+      await expect(waitForWorkflow(workspace.client, runId, ["complete"])).resolves.toMatchObject({
+        run: { id: runId },
+      });
     } finally {
       gate?.release();
       await page.goto("about:blank").catch(() => undefined);
@@ -801,6 +852,20 @@ function isWorkflowSpecSaveResponse(message: string | Buffer): boolean {
       message?: { type?: unknown };
     };
     return envelope.type === "session" && envelope.message?.type === "workflow.spec.save.response";
+  } catch {
+    return false;
+  }
+}
+
+function isWorkflowRunStartResponse(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return envelope.type === "session" && envelope.message?.type === "workflow.run.start.response";
   } catch {
     return false;
   }

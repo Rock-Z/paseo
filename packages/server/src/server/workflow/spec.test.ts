@@ -229,6 +229,19 @@ describe("workflow spec validation and materialization", () => {
     ).toThrow("parameters.objective: required");
   });
 
+  it.each(["__proto__", "constructor", "prototype"])(
+    "rejects undeclared supplied parameter %j even when it names a prototype property",
+    (name) => {
+      const values = JSON.parse(`{"objective":"test","${name}":"unexpected"}`) as JsonObject;
+      expect(() =>
+        materializeWorkflowSpec(baseSpec(), values, {
+          workspaceId: "workspace-1",
+          worktreePath: "/repo/worktree",
+        }),
+      ).toThrow(`parameters.${name}: unknown parameter`);
+    },
+  );
+
   it.each(["boolean", "integer", "number", "object", "array"])(
     "rejects a current-context default for a %s parameter",
     (type) => {

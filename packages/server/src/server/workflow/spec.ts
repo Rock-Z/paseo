@@ -1025,7 +1025,7 @@ export function materializeWorkflowSpec(
   }
   const declarations = isObject(template.parameters) ? template.parameters : {};
   for (const name of Object.keys(values)) {
-    if (!(name in declarations)) {
+    if (!Object.prototype.hasOwnProperty.call(declarations, name)) {
       throw new Error(`parameters.${name}: unknown parameter`);
     }
   }
@@ -1035,7 +1035,7 @@ export function materializeWorkflowSpec(
       continue;
     }
     let value: unknown;
-    if (name in values) {
+    if (Object.prototype.hasOwnProperty.call(values, name)) {
       value = values[name];
     } else if ("default" in rawDeclaration) {
       value = rawDeclaration.default;
