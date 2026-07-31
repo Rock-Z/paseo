@@ -82,6 +82,7 @@ export class WorkflowService {
   private readonly storage: WorkflowStorage;
   private readonly adapter: WorkflowRuntimeAdapter;
   private readonly drivePromises = new Map<string, Promise<void>>();
+  private readonly pendingDriveKicks = new Set<string>();
   private readonly turnPromises = new Map<string, Promise<void>>();
   private readonly runLockTails = new Map<string, Promise<void>>();
   private readonly agentLockTails = new Map<string, Promise<void>>();
@@ -114,6 +115,7 @@ export class WorkflowService {
 
   dispose(): void {
     this.disposed = true;
+    this.pendingDriveKicks.clear();
     for (const timer of this.limitTimers.values()) clearTimeout(timer);
     this.limitTimers.clear();
   }
@@ -346,12 +348,18 @@ export class WorkflowService {
   }
 
   private kick(runId: string): void {
-    if (this.disposed || this.drivePromises.has(runId)) return;
+    if (this.disposed) return;
+    if (this.drivePromises.has(runId)) {
+      this.pendingDriveKicks.add(runId);
+      return;
+    }
+    this.pendingDriveKicks.delete(runId);
     const promise = Promise.resolve()
       .then(() => this.drive(runId))
       .catch((error) => this.failRun(runId, error))
       .finally(() => {
         this.drivePromises.delete(runId);
+        if (this.pendingDriveKicks.delete(runId) && !this.disposed) this.kick(runId);
       });
     this.drivePromises.set(runId, promise);
   }
@@ -458,7 +466,16 @@ export class WorkflowService {
     if (instance.id === "root") {
       await this.adapter.validateMaterializedSpec(spec, {});
     }
-    const request = instance.workspaceRequest;
+    const latestState = parseState(await this.storage.readState(runId));
+    const latestInstance = requireInstance(latestState, instance.id);
+    if (
+      isTerminal(latestState.status) ||
+      latestState.stopRequested ||
+      latestInstance.status !== "provisioning"
+    ) {
+      return;
+    }
+    const request = latestInstance.workspaceRequest;
     if (!request) throw new Error(`instance ${instance.id} has no workspace request`);
     let workspace: WorkflowWorkspace;
     if (request.kind === "bound") {
@@ -476,7 +493,13 @@ export class WorkflowService {
     }
     await this.transact(runId, (tx) => {
       const current = requireInstance(tx.state, instance.id);
-      if (current.status !== "provisioning") return;
+      if (
+        isTerminal(tx.state.status) ||
+        tx.state.stopRequested ||
+        current.status !== "provisioning"
+      ) {
+        return;
+      }
       current.workspace = workspace;
       current.workspaceRequest = null;
       current.status = "runnable";

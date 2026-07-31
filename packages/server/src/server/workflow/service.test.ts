@@ -13,7 +13,7 @@ import type {
 import { WorkflowService } from "./service.js";
 import type { JsonObject, WorkflowCallerContext } from "./spec.js";
 import type { WorkflowWorkspace } from "./state.js";
-import { WorkflowStorage } from "./storage.js";
+import { WorkflowStorage, type WorkflowStorageOptions } from "./storage.js";
 
 const roots: string[] = [];
 
@@ -35,6 +35,7 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     agentId: string;
     nativeTurnId: string | null;
   }> = [];
+  validationCalls = 0;
   validateGate: Promise<void> = Promise.resolve();
   idleGate: Promise<void> = Promise.resolve();
   pauseAfterNativeSubmission = false;
@@ -48,6 +49,7 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
   private idleWaiters: Array<() => void> = [];
   private agentIdleWaiters = new Map<string, Array<() => void>>();
   private reconciliationWaiters: Array<() => void> = [];
+  private validationWaiters: Array<() => void> = [];
 
   async resolveCallerContext(input: {
     workspaceId?: string;
@@ -61,6 +63,8 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
   }
 
   async validateMaterializedSpec(): Promise<void> {
+    this.validationCalls += 1;
+    for (const resolve of this.validationWaiters.splice(0)) resolve();
     await this.validateGate;
   }
 
@@ -189,6 +193,12 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     if (this.reconciliations.length < count) await this.waitForReconciliations(count);
   }
 
+  async waitForValidations(count: number): Promise<void> {
+    if (this.validationCalls >= count) return;
+    await new Promise<void>((resolve) => this.validationWaiters.push(resolve));
+    if (this.validationCalls < count) await this.waitForValidations(count);
+  }
+
   complete(agentId: string, status: WorkflowTurnResult["status"] = "completed"): void {
     const pending = this.active.get(agentId);
     if (!pending) throw new Error(`no active turn for ${agentId}`);
@@ -237,9 +247,50 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
   }
 }
 
+class ReadHookWorkflowStorage extends WorkflowStorage {
+  private readHook:
+    | {
+        predicate: (state: JsonObject) => boolean;
+        callback: () => void | Promise<void>;
+      }
+    | undefined;
+
+  armReadHook(
+    predicate: (state: JsonObject) => boolean,
+    callback: () => void | Promise<void>,
+  ): void {
+    this.readHook = { predicate, callback };
+  }
+
+  override async readState(runId: string): Promise<JsonObject> {
+    const state = await super.readState(runId);
+    const hook = this.readHook;
+    if (!hook || !hook.predicate(state)) return state;
+    this.readHook = undefined;
+    await hook.callback();
+    return state;
+  }
+}
+
 async function setup(spec: JsonObject): Promise<{
   service: WorkflowService;
   storage: WorkflowStorage;
+  adapter: FakeRuntimeAdapter;
+}>;
+async function setup<TStorage extends WorkflowStorage>(
+  spec: JsonObject,
+  createStorage: (options: WorkflowStorageOptions) => TStorage,
+): Promise<{
+  service: WorkflowService;
+  storage: TStorage;
+  adapter: FakeRuntimeAdapter;
+}>;
+async function setup<TStorage extends WorkflowStorage = WorkflowStorage>(
+  spec: JsonObject,
+  createStorage?: (options: WorkflowStorageOptions) => TStorage,
+): Promise<{
+  service: WorkflowService;
+  storage: TStorage;
   adapter: FakeRuntimeAdapter;
 }> {
   const paseoHome = await fs.mkdtemp(path.join(os.tmpdir(), "workflow-service-"));
@@ -247,7 +298,9 @@ async function setup(spec: JsonObject): Promise<{
   const builtIns = path.join(paseoHome, "built-ins");
   await fs.mkdir(builtIns);
   await fs.writeFile(path.join(builtIns, `${String(spec.name)}.json`), JSON.stringify(spec));
-  const storage = new WorkflowStorage({ paseoHome, builtInDirectory: builtIns });
+  const storage = createStorage
+    ? createStorage({ paseoHome, builtInDirectory: builtIns })
+    : (new WorkflowStorage({ paseoHome, builtInDirectory: builtIns }) as TStorage);
   const adapter = new FakeRuntimeAdapter();
   const service = new WorkflowService({ storage, adapter });
   await service.initialize();
@@ -405,6 +458,88 @@ afterEach(async () => {
 });
 
 describe("WorkflowService runtime", () => {
+  it("retains a resume kick while the current driver is exiting", async () => {
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const { service, storage, adapter } = await setup(
+      twoTurnSpec("reuse-agent"),
+      (options) => new ReadHookWorkflowStorage(options),
+    );
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Do not lose the next turn" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForStarts(1);
+    await waitForActiveTurnPhase(storage, run.id, "running");
+    const first = adapter.starts[0];
+    const runtimeTimer = setTimeoutSpy.mock.calls
+      .toReversed()
+      .find((call) => typeof call[1] === "number" && call[1] > 3_000_000)?.[0];
+    expect(runtimeTimer).toBeTypeOf("function");
+
+    await expect(service.stopRun(run.id)).resolves.toMatchObject({ status: "stopping" });
+    await service.emitEvent({
+      callerAgentId: first.request.agentId,
+      event: "revised",
+      message: "launch the second turn",
+    });
+    adapter.complete(first.request.agentId);
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
+      status: "stopped",
+      reason: "requested",
+    });
+
+    storage.armReadHook(
+      (state) => state.status === "stopped",
+      () => service.resumeRun(run.id),
+    );
+    (runtimeTimer as () => void)();
+
+    const started = Date.now();
+    while (adapter.starts.length < 2 && Date.now() - started < 1_000) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    expect(adapter.starts).toHaveLength(2);
+    const second = adapter.starts[1];
+    await service.emitEvent({
+      callerAgentId: second.request.agentId,
+      event: "done",
+      data: { value: "complete" },
+    });
+    adapter.complete(second.request.agentId);
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
+      status: "complete",
+    });
+  });
+
+  it("does not create the root workspace after stop during materialized validation", async () => {
+    const spec = baseSpec();
+    spec.bindings = {};
+    const { service, adapter } = await setup(spec);
+    let releaseValidation!: () => void;
+    adapter.validateGate = new Promise<void>((resolve) => {
+      releaseValidation = resolve;
+    });
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Stop before root creation" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForValidations(1);
+
+    await expect(service.stopRun(run.id)).resolves.toMatchObject({
+      status: "stopped",
+      reason: "requested",
+    });
+    releaseValidation();
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    expect(adapter.workspaceCreates).toHaveLength(0);
+    const details = await service.inspectRun(run.id);
+    expect(details.run).toMatchObject({ status: "stopped", reason: "requested" });
+    expect(details.events.filter((event) => event.type === "workspace_ready")).toHaveLength(0);
+  });
+
   it("queues caller reuse immediately and waits for the invoking turn to become idle", async () => {
     const spec = baseSpec();
     (spec.parameters as JsonObject).workerThreadRef = {

@@ -72,11 +72,18 @@ describe("workflow launch form model", () => {
           required: false,
           defaultFrom: "current.agent",
         },
+        {
+          name: "literalNull",
+          type: "string",
+          description: "Literal text",
+          required: false,
+          defaultValue: "null",
+        },
       ],
     };
     let form = openWorkflowLaunchForm(bindingValidation);
     for (const name of ["workspaceRef", "worktreeRef", "workerThreadRef"]) {
-      form = updateWorkflowLaunchValue(form, name, "null");
+      form = updateWorkflowLaunchValue(form, name, null);
     }
 
     expect(submitWorkflowLaunchForm(form, bindingValidation)).toEqual({
@@ -85,6 +92,7 @@ describe("workflow launch form model", () => {
         workspaceRef: null,
         worktreeRef: null,
         workerThreadRef: null,
+        literalNull: "null",
       },
     });
   });

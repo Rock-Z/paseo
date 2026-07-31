@@ -46,6 +46,16 @@ test.describe("Native workflows", () => {
         timeout: 30_000,
       });
 
+      await page.getByTestId("workflow-spec-goal").click();
+      const workspaceBinding = page.getByTestId("workflow-param-workspaceRef").getByRole("textbox");
+      await page.getByTestId("workflow-param-workspaceRef-null").click();
+      await expect(workspaceBinding).toHaveValue("null (explicit)");
+      await expect(page.getByTestId("workflow-param-workspaceRef-null")).toContainText(
+        "Use current default",
+      );
+      await page.getByTestId("workflow-param-workspaceRef-null").click();
+      await expect(workspaceBinding).toHaveValue("");
+
       await page.getByTestId("workflows-new-json").click();
       const editor = page.getByLabel("Workflow JSON");
       await editor.fill("{");

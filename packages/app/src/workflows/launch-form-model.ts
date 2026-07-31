@@ -2,7 +2,7 @@ import type { WorkflowValidationResult } from "@getpaseo/protocol/workflow/types
 import equal from "fast-deep-equal";
 
 export interface WorkflowLaunchForm {
-  values: Record<string, string>;
+  values: Record<string, string | null>;
   errors: Record<string, string>;
 }
 
@@ -21,7 +21,7 @@ export function openWorkflowLaunchForm(validation: WorkflowValidationResult): Wo
 export function updateWorkflowLaunchValue(
   form: WorkflowLaunchForm,
   name: string,
-  value: string,
+  value: string | null,
 ): WorkflowLaunchForm {
   const { [name]: _removed, ...errors } = form.errors;
   return { values: { ...form.values, [name]: value }, errors };
@@ -34,7 +34,16 @@ export function submitWorkflowLaunchForm(
   const parameters: Record<string, unknown> = {};
   const errors: Record<string, string> = {};
   for (const declaration of validation.parameters) {
-    const raw = form.values[declaration.name]?.trim() ?? "";
+    const value = form.values[declaration.name];
+    if (value === null) {
+      if (declaration.required) {
+        errors[declaration.name] = "Required";
+      } else {
+        parameters[declaration.name] = null;
+      }
+      continue;
+    }
+    const raw = value?.trim() ?? "";
     if (!raw) {
       if (declaration.required && declaration.defaultFrom === undefined) {
         errors[declaration.name] = "Required";
@@ -42,8 +51,7 @@ export function submitWorkflowLaunchForm(
       continue;
     }
     try {
-      parameters[declaration.name] =
-        raw === "null" && !declaration.required ? null : parseParameterValue(raw, declaration);
+      parameters[declaration.name] = parseParameterValue(raw, declaration);
     } catch (error) {
       errors[declaration.name] = error instanceof Error ? error.message : String(error);
     }

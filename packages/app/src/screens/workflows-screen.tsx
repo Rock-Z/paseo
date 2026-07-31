@@ -340,7 +340,7 @@ function WorkflowHostScreen({
   const handleRefresh = useCallback(() => {
     void load();
   }, [load]);
-  const handleLaunchFormChange = useCallback((name: string, value: string) => {
+  const handleLaunchFormChange = useCallback((name: string, value: string | null) => {
     setLaunchForm((current) => updateWorkflowLaunchValue(current, name, value));
   }, []);
   const handleLaunch = useCallback(() => {
@@ -590,7 +590,7 @@ function LaunchForm({
   validation: WorkflowValidationResult;
   form: WorkflowLaunchForm;
   context: { workspaceId?: string; agentId?: string };
-  onChange: (name: string, value: string) => void;
+  onChange: (name: string, value: string | null) => void;
   onLaunch: () => void;
   pending: boolean;
 }): ReactElement {
@@ -601,7 +601,7 @@ function LaunchForm({
         <WorkflowParameterField
           key={parameter.name}
           parameter={parameter}
-          value={form.values[parameter.name] ?? ""}
+          value={form.values[parameter.name] === undefined ? "" : form.values[parameter.name]}
           error={form.errors[parameter.name]}
           context={context}
           onChange={onChange}
@@ -630,15 +630,19 @@ function WorkflowParameterField({
   pending,
 }: {
   parameter: WorkflowValidationResult["parameters"][number];
-  value: string;
+  value: string | null;
   error: string | undefined;
   context: { workspaceId?: string; agentId?: string };
-  onChange: (name: string, value: string) => void;
+  onChange: (name: string, value: string | null) => void;
   pending: boolean;
 }): ReactElement {
   const handleChange = useCallback(
     (nextValue: string) => onChange(parameter.name, nextValue),
     [onChange, parameter.name],
+  );
+  const handleToggleNull = useCallback(
+    () => onChange(parameter.name, value === null ? "" : null),
+    [onChange, parameter.name, value],
   );
   const hint = parameter.defaultFrom
     ? `${parameter.description} Uses ${parameter.defaultFrom} when left blank.`
@@ -650,12 +654,26 @@ function WorkflowParameterField({
       error={error}
       testID={`workflow-param-${parameter.name}`}
     >
-      <FormTextInput
-        value={value}
-        onChangeText={handleChange}
-        placeholder={parameterPlaceholder(parameter, context)}
-        editable={!pending}
-      />
+      <View style={styles.parameterControls}>
+        <FormTextInput
+          initialValue={value === null ? "null (explicit)" : value}
+          resetKey={value === null ? "explicit-null" : "value"}
+          onChangeText={handleChange}
+          placeholder={parameterPlaceholder(parameter, context)}
+          editable={!pending && value !== null}
+        />
+        {parameter.defaultFrom && !parameter.required ? (
+          <Button
+            variant="outline"
+            size="xs"
+            onPress={handleToggleNull}
+            disabled={pending}
+            testID={`workflow-param-${parameter.name}-null`}
+          >
+            {value === null ? "Use current default" : "Set null"}
+          </Button>
+        ) : null}
+      </View>
     </Field>
   );
 }
@@ -1033,6 +1051,10 @@ const styles = StyleSheet.create((theme) => ({
     alignItems: "center",
     gap: theme.spacing[2],
     flexWrap: "wrap",
+  },
+  parameterControls: {
+    gap: theme.spacing[2],
+    alignItems: "flex-start",
   },
   jsonEditor: {
     minHeight: 220,
