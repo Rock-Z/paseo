@@ -284,7 +284,6 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
       };
     }
     if (
-      input.nativeTurnId &&
       this.isAgentBusy(input.agentId) &&
       (await this.hasSubmittedWorkflowTurn(input.agentId, input.clientMessageId))
     ) {
@@ -293,6 +292,9 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
         input.nativeTurnId,
         this.waitForTurnResult(input.agentId, input.nativeTurnId, input.clientMessageId, true),
       );
+      if (!input.nativeTurnId) {
+        return { state: "completed", result: await result };
+      }
       return {
         state: "active",
         nativeTurnId: input.nativeTurnId,
@@ -410,7 +412,7 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
 
   private async waitForTurnResult(
     agentId: string,
-    nativeTurnId: string,
+    nativeTurnId: string | null,
     clientMessageId: string,
     autonomous = false,
   ): Promise<WorkflowTurnResult> {

@@ -260,6 +260,84 @@ describe("PaseoWorkflowRuntimeAdapter", () => {
     ).resolves.toEqual({ state: "missing" });
   });
 
+  it("waits for an identified autonomous turn to settle before recovering without a native ID", async () => {
+    const rows: Array<{
+      item:
+        | { type: "user_message"; clientMessageId: string }
+        | { type: "assistant_message"; text: string };
+    }> = [
+      {
+        item: {
+          type: "user_message" as const,
+          clientMessageId: "client-workflow",
+        },
+      },
+    ];
+    const agent = {
+      id: "agent-workflow",
+      activeForegroundTurnId: null,
+      lifecycle: "running",
+      recentTurnReceipts: [],
+    };
+    let busy = true;
+    let publishAgentState: ((event: { type: "agent_state" }) => void) | null = null;
+    let markSubscribed: (() => void) | null = null;
+    const subscribed = new Promise<void>((resolve) => {
+      markSubscribed = resolve;
+    });
+    const adapter = new PaseoWorkflowRuntimeAdapter({
+      agentManager: {
+        getAgent: vi.fn(() => agent),
+        getActiveForegroundClientMessageId: vi.fn(() => null),
+        getTimelineRows: vi.fn(async () => rows),
+        subscribe: vi.fn((callback) => {
+          publishAgentState = callback;
+          markSubscribed?.();
+          return () => undefined;
+        }),
+        hasInFlightRun: vi.fn(() => busy),
+      } as never,
+      agentStorage: {} as never,
+      providerSnapshotManager: {} as never,
+      workspaceRegistry: {} as never,
+      createAgent: (() => undefined) as never,
+      createPaseoWorktree: (() => undefined) as never,
+      logger: {} as never,
+    });
+
+    const reconciliation = adapter.reconcileTurn({
+      agentId: agent.id,
+      nativeTurnId: null,
+      clientMessageId: "client-workflow",
+    });
+    await expect(
+      Promise.race([subscribed.then(() => true), reconciliation.then(() => false)]),
+    ).resolves.toBe(true);
+    const pending = Symbol("pending");
+    await expect(Promise.race([reconciliation, Promise.resolve(pending)])).resolves.toBe(pending);
+
+    busy = false;
+    agent.lifecycle = "idle";
+    rows.push({
+      item: {
+        type: "assistant_message" as const,
+        text: "settled response",
+      },
+    });
+    publishAgentState?.({ type: "agent_state" });
+
+    await expect(reconciliation).resolves.toEqual({
+      state: "completed",
+      result: {
+        agentId: agent.id,
+        nativeTurnId: null,
+        status: "completed",
+        lastMessage: "settled response",
+        lastError: null,
+      },
+    });
+  });
+
   it("reuses the native workspace record after worktree provisioning survives a restart", async () => {
     const stableSlug = "workflow-abcdefghijkl-root";
     const workspace = {
