@@ -70,23 +70,33 @@ describe("workflow launch form model", () => {
           type: "enum",
           description: "Mode",
           required: true,
-          defaultValue: { kind: "review" },
-          values: ["fast", 2, true, { kind: "review" }],
+          defaultValue: { kind: "review", extra: true },
+          values: ["fast", 2, true, { kind: "review", extra: true }],
         },
       ],
     };
 
     const defaultForm = openWorkflowLaunchForm(enumValidation);
-    expect(defaultForm.values.mode).toBe('{"kind":"review"}');
+    expect(defaultForm.values.mode).toBe('{"kind":"review","extra":true}');
     expect(submitWorkflowLaunchForm(defaultForm, enumValidation)).toEqual({
       ok: true,
-      parameters: { mode: { kind: "review" } },
+      parameters: { mode: { kind: "review", extra: true } },
     });
 
     const booleanForm = updateWorkflowLaunchValue(defaultForm, "mode", "true");
     expect(submitWorkflowLaunchForm(booleanForm, enumValidation)).toEqual({
       ok: true,
       parameters: { mode: true },
+    });
+
+    const reorderedObjectForm = updateWorkflowLaunchValue(
+      defaultForm,
+      "mode",
+      '{"extra":true,"kind":"review"}',
+    );
+    expect(submitWorkflowLaunchForm(reorderedObjectForm, enumValidation)).toEqual({
+      ok: true,
+      parameters: { mode: { kind: "review", extra: true } },
     });
   });
 

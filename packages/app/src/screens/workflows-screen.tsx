@@ -130,6 +130,7 @@ function WorkflowHostScreen({
   const [editorOpen, setEditorOpen] = useState(false);
   const [editor, setEditor] = useState("");
   const selectedRunIdRef = useRef<string | null>(null);
+  const selectedSpecRequestRef = useRef(0);
 
   const client = useHostRuntimeClient(serverId);
 
@@ -188,6 +189,7 @@ function WorkflowHostScreen({
   );
 
   useEffect(() => {
+    selectedSpecRequestRef.current += 1;
     selectedRunIdRef.current = null;
     setDetails(null);
     setSelectedSpec(null);
@@ -208,19 +210,24 @@ function WorkflowHostScreen({
   const chooseSpec = useCallback(
     async (spec: WorkflowSpecSummary) => {
       if (!client) return;
+      const request = ++selectedSpecRequestRef.current;
       setAction({ kind: "pending", message: `Loading ${spec.name}…` });
       try {
         const payload = await client.workflowSpecGet(spec.id);
+        if (selectedSpecRequestRef.current !== request) return;
         if (payload.error) throw new Error(payload.error);
         if (!payload.spec) throw new Error(`Workflow definition not found: ${spec.id}`);
         const validationPayload = await client.workflowSpecValidate(payload.spec);
+        if (selectedSpecRequestRef.current !== request) return;
         if (validationPayload.error) throw new Error(validationPayload.error);
         setSelectedSpec(spec);
         setValidation(validationPayload.validation);
         setLaunchForm(openWorkflowLaunchForm(validationPayload.validation));
         setAction({ kind: "idle" });
       } catch (error) {
-        setAction({ kind: "error", message: errorMessage(error) });
+        if (selectedSpecRequestRef.current === request) {
+          setAction({ kind: "error", message: errorMessage(error) });
+        }
       }
     },
     [client],

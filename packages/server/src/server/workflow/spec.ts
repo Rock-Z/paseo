@@ -354,6 +354,11 @@ function validateWorkspace(value: unknown, path: string, issues: Issues): void {
   const targetPath = `${createPath}.target`;
   if (target.mode === "branch-off") {
     issues.unknown(target, targetPath, new Set(["mode", "newBranch", "base"]));
+    for (const field of ["newBranch", "base"]) {
+      if (field in target && (typeof target[field] !== "string" || target[field].length === 0)) {
+        issues.add(`${targetPath}.${field}`, "must be a non-empty string");
+      }
+    }
   } else if (target.mode === "checkout-branch") {
     issues.unknown(target, targetPath, new Set(["mode", "branch"]));
     if (typeof target.branch !== "string" || target.branch.length === 0) {
@@ -432,6 +437,14 @@ function validateCreateAgent(create: JsonObject, path: string, issues: Issues): 
     `${path}.settings`,
     new Set(["mode", "modeId", "thinking", "thinkingOptionId", "featureValues"]),
   );
+  for (const field of ["mode", "modeId", "thinking", "thinkingOptionId"]) {
+    if (field in create.settings && typeof create.settings[field] !== "string") {
+      issues.add(`${path}.settings.${field}`, "must be a string");
+    }
+  }
+  if ("featureValues" in create.settings && !isObject(create.settings.featureValues)) {
+    issues.add(`${path}.settings.featureValues`, "must be an object");
+  }
 }
 
 function validatePrompts(value: unknown, issues: Issues): void {

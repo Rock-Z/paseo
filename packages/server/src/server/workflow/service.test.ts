@@ -38,12 +38,14 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
   validateGate: Promise<void> = Promise.resolve();
   idleGate: Promise<void> = Promise.resolve();
   pauseAfterNativeSubmission = false;
+  concurrentStartRejections = 0;
   maxActive = 0;
   private active = new Map<string, PendingTurn>();
   private nextAgent = 1;
   private nextTurn = 1;
   private waiters: Array<() => void> = [];
   private idleWaiters: Array<() => void> = [];
+  private agentIdleWaiters = new Map<string, Array<() => void>>();
   private reconciliationWaiters: Array<() => void> = [];
 
   async resolveCallerContext(input: {
@@ -96,9 +98,29 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     this.idleWaits.push(agentId);
     this.flushIdleWaiters();
     await this.idleGate;
+    while (this.active.has(agentId)) {
+      await new Promise<void>((resolve) => {
+        const waiters = this.agentIdleWaiters.get(agentId) ?? [];
+        waiters.push(resolve);
+        this.agentIdleWaiters.set(agentId, waiters);
+      });
+    }
   }
 
   startTurn(request: WorkflowTurnRequest): WorkflowTurnHandle {
+    if (this.active.has(request.agentId)) {
+      this.concurrentStartRejections += 1;
+      return {
+        nativeTurnId: Promise.resolve(null),
+        result: Promise.resolve({
+          agentId: request.agentId,
+          nativeTurnId: null,
+          status: "failed",
+          lastMessage: "",
+          lastError: "native agent already has an active turn",
+        }),
+      };
+    }
     const nativeTurnId = `native-turn-${this.nextTurn++}`;
     let resolve!: (result: WorkflowTurnResult) => void;
     const result = new Promise<WorkflowTurnResult>((resolvePromise) => {
@@ -166,6 +188,8 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     const pending = this.active.get(agentId);
     if (!pending) throw new Error(`no active turn for ${agentId}`);
     this.active.delete(agentId);
+    for (const resolve of this.agentIdleWaiters.get(agentId) ?? []) resolve();
+    this.agentIdleWaiters.delete(agentId);
     pending.resolve({
       agentId,
       nativeTurnId: pending.nativeTurnId,
@@ -461,6 +485,68 @@ describe("WorkflowService runtime", () => {
       data: { value: "second" },
     });
     adapter.complete("agent-shared");
+    await expect(waitForRunTerminal(service, second.id)).resolves.toMatchObject({
+      status: "complete",
+    });
+  });
+
+  it("serializes the idle check and native submission for a shared agent", async () => {
+    const spec = baseSpec();
+    (spec.parameters as JsonObject).workerThreadRef = {
+      type: "string",
+      required: true,
+      defaultFrom: "current.agent",
+    };
+    (spec.bindings as JsonObject).agents = {
+      worker: "{{ parameters.workerThreadRef }}",
+    };
+    const { service, adapter } = await setup(spec);
+    const context = { workspaceId: "workspace-root", agentId: "agent-shared" };
+    let releaseIdle!: () => void;
+    adapter.idleGate = new Promise<void>((resolve) => {
+      releaseIdle = resolve;
+    });
+
+    const first = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "First shared turn" },
+      context,
+    });
+    const second = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Second shared turn" },
+      context,
+    });
+    await adapter.waitForIdleWaits(2);
+    releaseIdle();
+    await adapter.waitForStarts(1);
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    expect(adapter.concurrentStartRejections).toBe(0);
+    expect(adapter.starts).toHaveLength(1);
+    const firstTurn = adapter.starts[0];
+    await service.emitEvent({
+      callerAgentId: firstTurn.request.agentId,
+      event: "done",
+      message: "first finished",
+      data: { value: "first" },
+    });
+    adapter.complete(firstTurn.request.agentId);
+
+    await adapter.waitForStarts(2);
+    const secondTurn = adapter.starts[1];
+    expect(secondTurn.request.runId).not.toBe(firstTurn.request.runId);
+    await service.emitEvent({
+      callerAgentId: secondTurn.request.agentId,
+      event: "done",
+      message: "second finished",
+      data: { value: "second" },
+    });
+    adapter.complete(secondTurn.request.agentId);
+
+    await expect(waitForRunTerminal(service, first.id)).resolves.toMatchObject({
+      status: "complete",
+    });
     await expect(waitForRunTerminal(service, second.id)).resolves.toMatchObject({
       status: "complete",
     });
@@ -1147,6 +1233,42 @@ describe("WorkflowService runtime", () => {
     await expect(waitForRunTerminal(runtime.service, runtimeRun.id)).resolves.toMatchObject({
       status: "stopped",
       reason: "max_runtime",
+    });
+  });
+
+  it("preserves a runtime-limit stop reason when stop is requested again", async () => {
+    const { service, storage, adapter } = await setup(baseSpec());
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Keep the limit reason" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForStarts(1);
+    await waitForActiveTurnPhase(storage, run.id, "running");
+    const state = await storage.readState(run.id);
+    state.stopRequested = true;
+    state.status = "stopping";
+    state.reason = "max_runtime";
+    await storage.commitRunTransaction(run.id, { state, events: [] });
+
+    await expect(service.stopRun(run.id)).resolves.toMatchObject({
+      status: "stopping",
+      reason: "max_runtime",
+      resumable: false,
+    });
+
+    const turn = adapter.starts[0];
+    await service.emitEvent({
+      callerAgentId: turn.request.agentId,
+      event: "done",
+      message: "drained after limit",
+      data: { value: "late" },
+    });
+    adapter.complete(turn.request.agentId);
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
+      status: "stopped",
+      reason: "max_runtime",
+      resumable: false,
     });
   });
 

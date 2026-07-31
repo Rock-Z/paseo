@@ -240,7 +240,15 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     }
     agent = this.agentManager.getAgent(input.agentId) ?? agent;
     const activeTurnId = agent.activeForegroundTurnId;
-    if (activeTurnId && (!input.nativeTurnId || input.nativeTurnId === activeTurnId)) {
+    const activeClientMessageId = this.agentManager.getActiveForegroundClientMessageId(
+      input.agentId,
+    );
+    if (
+      activeTurnId &&
+      (input.nativeTurnId
+        ? input.nativeTurnId === activeTurnId
+        : input.clientMessageId === activeClientMessageId)
+    ) {
       const result = this.withResumedTurnCleanup(
         input.agentId,
         input.nativeTurnId,

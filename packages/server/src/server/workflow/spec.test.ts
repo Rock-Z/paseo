@@ -215,6 +215,53 @@ describe("workflow spec validation and materialization", () => {
     );
   });
 
+  it("rejects invalid native agent setting value types", () => {
+    const spec = baseSpec();
+    const agents = spec.agents as Record<string, Record<string, Record<string, unknown>>>;
+    agents.worker.createAgent.settings = {
+      mode: 1,
+      modeId: null,
+      thinking: false,
+      thinkingOptionId: {},
+      featureValues: [],
+    };
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues.map((issue) => issue.path)).toEqual(
+      expect.arrayContaining([
+        "agents.worker.createAgent.settings.mode",
+        "agents.worker.createAgent.settings.modeId",
+        "agents.worker.createAgent.settings.thinking",
+        "agents.worker.createAgent.settings.thinkingOptionId",
+        "agents.worker.createAgent.settings.featureValues",
+      ]),
+    );
+  });
+
+  it.each([
+    ["newBranch", null],
+    ["newBranch", 1],
+    ["newBranch", ""],
+    ["base", null],
+    ["base", 1],
+    ["base", ""],
+  ])("rejects branch-off %s value %j", (field, value) => {
+    const spec = baseSpec();
+    const workspace = spec.workspace as Record<string, Record<string, unknown>>;
+    const createWorktree = workspace.createWorktree;
+    const target = createWorktree.target as Record<string, unknown>;
+    target[field] = value;
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual(
+      expect.objectContaining({
+        path: `workspace.createWorktree.target.${field}`,
+      }),
+    );
+  });
+
   it("validates every action and ordered bounded map declaration", () => {
     const spec = baseSpec();
     const flows = spec.flows as Record<string, Record<string, unknown>>;

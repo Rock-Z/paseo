@@ -83,7 +83,8 @@ export class WorkflowService {
   private readonly adapter: WorkflowRuntimeAdapter;
   private readonly drivePromises = new Map<string, Promise<void>>();
   private readonly turnPromises = new Map<string, Promise<void>>();
-  private readonly lockTails = new Map<string, Promise<void>>();
+  private readonly runLockTails = new Map<string, Promise<void>>();
+  private readonly agentLockTails = new Map<string, Promise<void>>();
   private readonly limitTimers = new Map<string, NodeJS.Timeout>();
   private initialized = false;
   private started = false;
@@ -202,16 +203,20 @@ export class WorkflowService {
     this.requireInitialized();
     await this.transact(runId, (tx) => {
       if (isTerminal(tx.state.status)) return;
+      const reason =
+        tx.state.status === "stopping" && isLimitReason(tx.state.reason)
+          ? tx.state.reason
+          : "requested";
       tx.state.stopRequested = true;
       tx.state.status = hasActiveTurns(tx.state) ? "stopping" : "stopped";
-      tx.state.reason = "requested";
+      tx.state.reason = reason;
       if (tx.state.status === "stopped") tx.state.completedAt = new Date().toISOString();
       queueEvent(tx, {
         type: "stop_requested",
         details: { activeTurns: countActiveTurns(tx.state) },
       });
       if (tx.state.status === "stopped") {
-        queueEvent(tx, { type: "run_stopped", details: { reason: "requested" } });
+        queueEvent(tx, { type: "run_stopped", details: { reason } });
       }
     });
     this.kick(runId);
@@ -630,21 +635,24 @@ export class WorkflowService {
       (candidate) => candidate.name === turn.promptPath,
     )?.content;
     if (prompt === undefined) throw new Error(`rendered prompt is missing: ${turn.promptPath}`);
-    const started = await this.startTurnIfAllowed(runId, instanceId, turn.workflowTurnId, agentId, {
-      runId,
-      workflowTurnId: turn.workflowTurnId,
-      clientMessageId: turn.clientMessageId,
-      instanceId,
-      agentId,
-      prompt,
-      labels: {
-        "paseo.workflow.name": state.workflow.name,
-        "paseo.workflow.run": runId,
-        "paseo.workflow.instance": instanceId,
-        "paseo.workflow.flow": instance.flow,
-        "paseo.workflow.agent": turn.agent,
-        "paseo.workflow.iteration": String(turn.iteration),
-      },
+    const started = await this.withAgentLock(agentId, async () => {
+      await this.adapter.waitUntilAgentIdle(agentId);
+      return this.startTurnIfAllowed(runId, instanceId, turn.workflowTurnId, agentId, {
+        runId,
+        workflowTurnId: turn.workflowTurnId,
+        clientMessageId: turn.clientMessageId,
+        instanceId,
+        agentId,
+        prompt,
+        labels: {
+          "paseo.workflow.name": state.workflow.name,
+          "paseo.workflow.run": runId,
+          "paseo.workflow.instance": instanceId,
+          "paseo.workflow.flow": instance.flow,
+          "paseo.workflow.agent": turn.agent,
+          "paseo.workflow.iteration": String(turn.iteration),
+        },
+      });
     });
     if (!started) return;
     const nativeTurnId = await started.nativeTurnId;
@@ -990,21 +998,33 @@ export class WorkflowService {
   }
 
   private async withLock<T>(runId: string, callback: () => Promise<T>): Promise<T> {
-    const previous = this.lockTails.get(runId) ?? Promise.resolve();
+    return this.withLockTail(this.runLockTails, runId, callback);
+  }
+
+  private async withAgentLock<T>(agentId: string, callback: () => Promise<T>): Promise<T> {
+    return this.withLockTail(this.agentLockTails, agentId, callback);
+  }
+
+  private async withLockTail<T>(
+    tails: Map<string, Promise<void>>,
+    key: string,
+    callback: () => Promise<T>,
+  ): Promise<T> {
+    const previous = tails.get(key) ?? Promise.resolve();
     let release!: () => void;
     const current = new Promise<void>((resolve) => {
       release = resolve;
     });
     const tail = previous.then(() => current);
-    this.lockTails.set(runId, tail);
+    tails.set(key, tail);
     await previous;
     try {
       return await callback();
     } finally {
       release();
-      if (this.lockTails.get(runId) === tail) {
+      if (tails.get(key) === tail) {
         tail.finally(() => {
-          if (this.lockTails.get(runId) === tail) this.lockTails.delete(runId);
+          if (tails.get(key) === tail) tails.delete(key);
         });
       }
     }
@@ -1569,6 +1589,10 @@ function limitReason(state: WorkflowRunState, limits: JsonObject): string | null
     return "max_runtime";
   }
   return null;
+}
+
+function isLimitReason(reason: string | null): reason is "max_iterations" | "max_runtime" {
+  return reason === "max_iterations" || reason === "max_runtime";
 }
 
 function applyLimit(tx: Transaction, reason: string): void {

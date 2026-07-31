@@ -1,4 +1,5 @@
 import type { WorkflowValidationResult } from "@getpaseo/protocol/workflow/types";
+import equal from "fast-deep-equal";
 
 export interface WorkflowLaunchForm {
   values: Record<string, string>;
@@ -95,10 +96,7 @@ function parseEnumValue(raw: string, values: unknown[]): unknown {
   } catch {
     throw new Error(`Choose one of ${values.map(formatDefaultValue).join(", ")}`);
   }
-  const serialized = JSON.stringify(parsed);
-  const match = values.find(
-    (value) => typeof value !== "string" && JSON.stringify(value) === serialized,
-  );
+  const match = values.find((value) => typeof value !== "string" && equal(value, parsed));
   if (match === undefined) {
     throw new Error(`Choose one of ${values.map(formatDefaultValue).join(", ")}`);
   }

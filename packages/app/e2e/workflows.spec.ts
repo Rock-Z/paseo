@@ -99,7 +99,7 @@ test.describe("Native workflows", () => {
   test("keeps the latest run selected when an older inspection arrives late", async ({ page }) => {
     const workspace = await seedWorkspace({ repoPrefix: "workflow-selection-" });
     const name = uniqueWorkflowName("selection");
-    let gate: WorkflowInspectResponseGate | null = null;
+    let gate: WorkflowResponseGate | null = null;
     try {
       await enablePaseoTools(workspace.client);
       await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 0 }));
@@ -114,7 +114,10 @@ test.describe("Native workflows", () => {
       });
       await waitForWorkflow(workspace.client, secondRunId, ["complete"]);
 
-      gate = await delayWorkflowInspectResponse(page, firstRunId);
+      gate = await delayWorkflowResponse(
+        page,
+        (message) => workflowInspectResponseRunId(message) === firstRunId,
+      );
       await page.goto(
         buildWorkflowsRoute({
           serverId: getServerId(),
@@ -133,6 +136,53 @@ test.describe("Native workflows", () => {
       await flushBrowserFrames(page);
       await expect(page.getByTestId("workflow-run-details")).toContainText(secondRunId);
       await expect(page.getByTestId("workflow-run-details")).not.toContainText(firstRunId);
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("keeps the latest workflow definition selected when an older load arrives late", async ({
+    page,
+  }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-spec-selection-" });
+    const firstName = uniqueWorkflowName("spec-first");
+    const secondName = uniqueWorkflowName("spec-second");
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      await saveWorkflow(
+        workspace.client,
+        buildSingleTurnWorkflow({ name: firstName, delayMs: 0 }),
+      );
+      await saveWorkflow(
+        workspace.client,
+        buildSingleTurnWorkflow({ name: secondName, delayMs: 0 }),
+      );
+      gate = await delayWorkflowResponse(
+        page,
+        (message) => workflowSpecGetResponseId(message) === firstName,
+      );
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByTestId(`workflow-spec-${firstName}`)).toBeVisible({
+        timeout: 30_000,
+      });
+      await page.getByTestId(`workflow-spec-${firstName}`).click();
+      await gate.waitForDelayedResponse();
+      await page.getByTestId(`workflow-spec-${secondName}`).click();
+      await expect(page.getByTestId("workflow-launch-form")).toContainText(`Launch ${secondName}`);
+
+      gate.release();
+      await flushBrowserFrames(page);
+      await expect(page.getByTestId("workflow-launch-form")).toContainText(`Launch ${secondName}`);
+      await expect(page.getByTestId("workflow-launch-form")).not.toContainText(
+        `Launch ${firstName}`,
+      );
     } finally {
       gate?.release();
       await page.goto("about:blank").catch(() => undefined);
@@ -509,15 +559,15 @@ interface WorkflowTimelineClient {
   }>;
 }
 
-interface WorkflowInspectResponseGate {
+interface WorkflowResponseGate {
   release(): void;
   waitForDelayedResponse(): Promise<void>;
 }
 
-async function delayWorkflowInspectResponse(
+async function delayWorkflowResponse(
   page: Page,
-  runId: string,
-): Promise<WorkflowInspectResponseGate> {
+  shouldDelay: (message: string | Buffer) => boolean,
+): Promise<WorkflowResponseGate> {
   let releaseRequested = false;
   let delayedResponseSeen = false;
   const delayedForwards: Array<() => void> = [];
@@ -530,7 +580,7 @@ async function delayWorkflowInspectResponse(
     const server = ws.connectToServer();
     ws.onMessage((message) => server.send(message));
     server.onMessage((message) => {
-      if (!delayedResponseSeen && workflowInspectResponseRunId(message) === runId) {
+      if (!delayedResponseSeen && shouldDelay(message)) {
         delayedResponseSeen = true;
         resolveDelayedResponse();
         if (releaseRequested) {
@@ -551,6 +601,27 @@ async function delayWorkflowInspectResponse(
     },
     waitForDelayedResponse: () => delayedResponse,
   };
+}
+
+function workflowSpecGetResponseId(message: string | Buffer): string | null {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: {
+        type?: unknown;
+        payload?: { summary?: { id?: unknown } };
+      };
+    };
+    const id =
+      envelope.type === "session" && envelope.message?.type === "workflow.spec.get.response"
+        ? envelope.message.payload?.summary?.id
+        : null;
+    return typeof id === "string" ? id : null;
+  } catch {
+    return null;
+  }
 }
 
 function workflowInspectResponseRunId(message: string | Buffer): string | null {
