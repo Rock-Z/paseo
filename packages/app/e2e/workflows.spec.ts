@@ -32,6 +32,9 @@ test.describe("Native workflows", () => {
     const spec = buildTwoTurnWorkflow({ name, delayMs: 1_500 });
     try {
       await enablePaseoTools(workspace.client);
+      await page.goto(buildWorkflowsRoute({ serverId: "removed-workflow-host" }));
+      await expect(page.getByTestId("workflows-new-json")).toBeVisible({ timeout: 30_000 });
+
       await page.goto(
         buildWorkflowsRoute({
           serverId: getServerId(),

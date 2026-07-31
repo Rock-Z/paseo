@@ -133,6 +133,56 @@ describe("workflow spec validation and materialization", () => {
     });
   });
 
+  it("matches object and array enum parameters by canonical JSON value", () => {
+    const spec = baseSpec();
+    const parameters = spec.parameters as Record<string, unknown>;
+    parameters.target = {
+      type: "enum",
+      required: true,
+      values: [{ region: "west", zones: ["b", "a"] }, ["fallback", { priority: 1 }]],
+    };
+    (spec.inputs as Record<string, unknown>).target = "{{ parameters.target }}";
+    const context = {
+      workspaceId: "workspace-1",
+      worktreePath: "/repo/worktree",
+    };
+
+    expect(
+      materializeWorkflowSpec(
+        spec,
+        {
+          objective: "Use an object enum",
+          target: { zones: ["b", "a"], region: "west" },
+        },
+        context,
+      ).spec,
+    ).toMatchObject({
+      inputs: { target: { region: "west", zones: ["b", "a"] } },
+    });
+    expect(
+      materializeWorkflowSpec(
+        spec,
+        {
+          objective: "Use an array enum",
+          target: ["fallback", { priority: 1 }],
+        },
+        context,
+      ).spec,
+    ).toMatchObject({
+      inputs: { target: ["fallback", { priority: 1 }] },
+    });
+  });
+
+  it("rejects explicit null for a required parameter", () => {
+    expect(() =>
+      materializeWorkflowSpec(
+        baseSpec(),
+        { objective: null },
+        { workspaceId: "workspace-1", worktreePath: "/repo/worktree" },
+      ),
+    ).toThrow("parameters.objective: required");
+  });
+
   it("rejects unknown fields, broken routes, undeclared parameters, and invalid event schemas", () => {
     const spec = baseSpec();
     spec.unexpected = true;

@@ -152,16 +152,16 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
       return existing.id;
     }
     const settings = isObject(input.create.settings) ? input.create.settings : {};
+    const modeId = firstString(settings.modeId, settings.mode);
+    const thinkingOptionId = firstString(settings.thinkingOptionId, settings.thinking);
     const provider = providerModelValue(input.create);
     const result = await this.createAgent({
       kind: "mcp",
       provider,
       title: stringValue(input.create.title, "createAgent.title"),
       config: {
-        ...(typeof settings.modeId === "string" ? { modeId: settings.modeId } : {}),
-        ...(typeof settings.thinkingOptionId === "string"
-          ? { thinkingOptionId: settings.thinkingOptionId }
-          : {}),
+        ...(modeId ? { modeId } : {}),
+        ...(thinkingOptionId ? { thinkingOptionId } : {}),
         ...(isObject(settings.featureValues) ? { featureValues: settings.featureValues } : {}),
       },
       cwd: input.workspace.cwd,

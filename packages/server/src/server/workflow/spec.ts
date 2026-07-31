@@ -812,6 +812,9 @@ function resolveDefault(source: string, context: WorkflowCallerContext): string 
 
 function coerceParameter(name: string, declaration: JsonObject, value: unknown): unknown {
   if (value === null || value === undefined) {
+    if (declaration.required === true) {
+      throw new Error(`parameters.${name}: required`);
+    }
     return null;
   }
   const type = parameterType(declaration);
@@ -829,7 +832,10 @@ function coerceParameter(name: string, declaration: JsonObject, value: unknown):
     return value;
   }
   if (type === "enum") {
-    if (!Array.isArray(declaration.values) || !declaration.values.includes(value)) {
+    if (
+      !Array.isArray(declaration.values) ||
+      !declaration.values.some((candidate) => canonicalJson(candidate) === canonicalJson(value))
+    ) {
       throw new Error(`${path}: must be one of ${JSON.stringify(declaration.values)}`);
     }
     return value;

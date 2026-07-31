@@ -44,4 +44,47 @@ describe("PaseoWorkflowRuntimeAdapter", () => {
     );
     expect(getProvider).toHaveBeenCalledOnce();
   });
+
+  it("normalizes validated mode and thinking aliases before creating an agent", async () => {
+    const createAgent = vi.fn(async () => ({ snapshot: { id: "agent-created" } }));
+    const adapter = new PaseoWorkflowRuntimeAdapter({
+      agentManager: {} as never,
+      agentStorage: { list: vi.fn(async () => []) } as never,
+      providerSnapshotManager: {} as never,
+      workspaceRegistry: {} as never,
+      createAgent: createAgent as never,
+      createPaseoWorktree: (() => undefined) as never,
+      logger: {} as never,
+    });
+
+    await expect(
+      adapter.ensureAgent({
+        runId: "run-settings",
+        workflowName: "settings-workflow",
+        instanceId: "root",
+        flow: "main",
+        role: "worker",
+        agentKey: "worker",
+        create: {
+          title: "Workflow worker",
+          provider: "codex",
+          settings: { mode: "plan", thinking: "high" },
+        },
+        workspace: {
+          workspaceId: "workspace-1",
+          cwd: process.cwd(),
+          name: "Workspace",
+        },
+        existingAgentId: null,
+      }),
+    ).resolves.toBe("agent-created");
+    expect(createAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: expect.objectContaining({
+          modeId: "plan",
+          thinkingOptionId: "high",
+        }),
+      }),
+    );
+  });
 });

@@ -57,7 +57,9 @@ export function WorkflowsScreen(): ReactElement {
       return;
     }
     if (!hosts.some((host) => host.serverId === selectedHost)) {
-      setSelectedHost(routeServerId ?? hosts[0]?.serverId ?? "");
+      setSelectedHost(
+        hosts.find((host) => host.serverId === routeServerId)?.serverId ?? hosts[0]?.serverId ?? "",
+      );
     }
   }, [hosts, routeServerId, selectedHost]);
 
