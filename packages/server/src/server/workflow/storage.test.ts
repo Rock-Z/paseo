@@ -58,7 +58,7 @@ describe("WorkflowStorage", () => {
     const { storage, builtIns, paseoHome } = await makeStorage();
     await fs.writeFile(path.join(builtIns, "echo-demo.json"), JSON.stringify(spec("echo-demo")));
 
-    await storage.saveUserSpec(spec("custom"));
+    await storage.saveUserSpec("custom", spec("custom"));
     const summaries = await storage.listSpecs();
 
     expect(summaries.map(({ id, source }) => ({ id, source }))).toEqual([
@@ -105,16 +105,21 @@ describe("WorkflowStorage", () => {
       startedAt: null,
       completedAt: null,
       loop: { iteration: 0, elapsedSeconds: 0 },
+      eventSeq: 1,
       instances: {},
     };
-    await storage.createRun("run-1", spec(), state);
-    await storage.appendEvent("run-1", {
-      seq: 1,
-      timestamp: now,
-      type: "run_queued",
-      details: { runId: "run-1" },
+    await storage.createRun("run-1", spec(), state, [
+      {
+        seq: 1,
+        timestamp: now,
+        type: "run_queued",
+        details: { runId: "run-1" },
+      },
+    ]);
+    await storage.commitRunTransaction("run-1", {
+      state: { ...state, status: "running", eventSeq: 2 },
+      events: [{ seq: 2, timestamp: now, type: "run_started" }],
     });
-    await storage.saveState("run-1", { ...state, status: "running" });
 
     const details = await storage.inspectRun("run-1");
     expect(details.run).toMatchObject({ id: "run-1", status: "running", legacy: false });
@@ -123,6 +128,7 @@ describe("WorkflowStorage", () => {
         type: "run_queued",
         details: { runId: "run-1" },
       }),
+      expect.objectContaining({ type: "run_started" }),
     ]);
     const files = await fs.readdir(path.join(paseoHome, "workflows", "runs", "run-1"));
     expect(files.some((name) => name.endsWith(".tmp"))).toBe(false);
@@ -135,10 +141,6 @@ describe("WorkflowStorage", () => {
     { step: "event", phase: "after", index: 0 },
     { step: "event", phase: "before", index: 1 },
     { step: "event", phase: "after", index: 1 },
-    { step: "accepted-event", phase: "before", index: 0 },
-    { step: "accepted-event", phase: "after", index: 0 },
-    { step: "accepted-event", phase: "before", index: 1 },
-    { step: "accepted-event", phase: "after", index: 1 },
     { step: "state", phase: "before" },
     { step: "state", phase: "after" },
     { step: "journal-cleanup", phase: "before" },
@@ -162,12 +164,13 @@ describe("WorkflowStorage", () => {
         eventSeq: 1,
         instances: {},
       };
-      await storage.createRun("transaction-run", spec(), initialState);
-      await storage.appendEvent("transaction-run", {
-        seq: 1,
-        timestamp: now,
-        type: "run_queued",
-      });
+      await storage.createRun("transaction-run", spec(), initialState, [
+        {
+          seq: 1,
+          timestamp: now,
+          type: "run_queued",
+        },
+      ]);
       const nextState = {
         ...initialState,
         status: "running",
@@ -205,28 +208,6 @@ describe("WorkflowStorage", () => {
               data: null,
             },
           ],
-          acceptedEvents: [
-            {
-              workflowTurnId: "wft_one",
-              event: {
-                event: "done",
-                message: "one",
-                data: null,
-                acceptedAt: "2026-07-30T00:00:02.000Z",
-                nativeTurnId: "turn-1",
-              },
-            },
-            {
-              workflowTurnId: "wft_two",
-              event: {
-                event: "done",
-                message: "two",
-                data: { value: 2 },
-                acceptedAt: "2026-07-30T00:00:02.000Z",
-                nativeTurnId: "turn-2",
-              },
-            },
-          ],
         }),
       ).rejects.toThrow("injected");
       expect(injected).toBe(true);
@@ -239,16 +220,6 @@ describe("WorkflowStorage", () => {
       expect(details.events.map((event) => event.seq)).toEqual(commitBegan ? [1, 2, 3] : [1]);
       expect(new Set(details.events.map((event) => event.seq)).size).toBe(details.events.length);
       expect(details.state.eventSeq).toBe(details.events.at(-1)?.seq);
-      const historyDirectory = path.join(
-        paseoHome,
-        "workflows",
-        "runs",
-        "transaction-run",
-        "event-history",
-      );
-      expect((await fs.readdir(historyDirectory)).sort()).toEqual(
-        commitBegan ? ["wft_one.json", "wft_two.json"] : [],
-      );
       await expect(
         fs.access(
           path.join(paseoHome, "workflows", "runs", "transaction-run", "pending-commit.json"),

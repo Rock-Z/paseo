@@ -1,9 +1,11 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import type { WorkflowRunSummary } from "@getpaseo/protocol/workflow/types";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   WorkflowRuntimeAdapter,
+  WorkflowStartedTurn,
   WorkflowTurnReconciliation,
   WorkflowTurnRequest,
   WorkflowTurnResult,
@@ -96,10 +98,7 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     await this.idleGate;
   }
 
-  async startTurn(
-    request: WorkflowTurnRequest,
-    onStarted: (nativeTurnId: string) => Promise<void>,
-  ): Promise<WorkflowTurnResult> {
+  async beginTurn(request: WorkflowTurnRequest): Promise<WorkflowStartedTurn> {
     const nativeTurnId = `native-turn-${this.nextTurn++}`;
     let resolve!: (result: WorkflowTurnResult) => void;
     const result = new Promise<WorkflowTurnResult>((resolvePromise) => {
@@ -113,11 +112,10 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     this.maxActive = Math.max(this.maxActive, this.active.size);
     if (this.pauseAfterNativeSubmission) {
       this.flushWaiters();
-      return new Promise<WorkflowTurnResult>(() => undefined);
+      return new Promise<WorkflowStartedTurn>(() => undefined);
     }
-    await onStarted(nativeTurnId);
     this.flushWaiters();
-    return result;
+    return { nativeTurnId, result };
   }
 
   async reconcileTurn(input: {
@@ -211,7 +209,39 @@ async function setup(spec: JsonObject): Promise<{
   const adapter = new FakeRuntimeAdapter();
   const service = new WorkflowService({ storage, adapter });
   await service.initialize();
+  await service.start();
   return { service, storage, adapter };
+}
+
+async function waitForRunTerminal(
+  service: WorkflowService,
+  runId: string,
+  timeoutMs = 10_000,
+): Promise<WorkflowRunSummary> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const run = await service.inspectRun(runId);
+    if (["stopped", "complete", "failed"].includes(run.run.status)) return run.run;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for workflow run ${runId}`);
+}
+
+async function waitForActiveTurnPhase(
+  storage: WorkflowStorage,
+  runId: string,
+  phase: "queued" | "launching" | "running",
+): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < 10_000) {
+    const state = await storage.readState(runId);
+    const instances = state.instances as JsonObject | undefined;
+    const root = instances?.root as JsonObject | undefined;
+    const activeTurn = root?.activeTurn as JsonObject | undefined;
+    if (activeTurn?.phase === phase) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for workflow turn phase ${phase}`);
 }
 
 function baseSpec(): JsonObject {
@@ -313,6 +343,7 @@ function twoTurnSpec(persistence: "reuse-agent" | "fresh-agent"): JsonObject {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
 
@@ -354,8 +385,37 @@ describe("WorkflowService runtime", () => {
       data: { value: "complete" },
     });
     adapter.complete("agent-caller");
-    await expect(service.waitForRunTerminal(run.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
       status: "complete",
+    });
+  });
+
+  it("does not submit a queued native turn after stop is acknowledged", async () => {
+    const { service, adapter } = await setup(baseSpec());
+    let releaseIdle!: () => void;
+    adapter.idleGate = new Promise<void>((resolve) => {
+      releaseIdle = resolve;
+    });
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Stop before submission" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForIdleWaits(1);
+
+    await expect(service.stopRun(run.id)).resolves.toMatchObject({ status: "stopping" });
+    releaseIdle();
+
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
+      status: "stopped",
+      reason: "requested",
+      resumable: true,
+    });
+    expect(adapter.starts).toHaveLength(0);
+    expect(adapter.externalEffects).toHaveLength(0);
+    const details = await service.inspectRun(run.id);
+    expect(details.events.find((event) => event.type === "turn_not_started")).toMatchObject({
+      details: { reason: "stop_requested" },
     });
   });
 
@@ -423,7 +483,7 @@ describe("WorkflowService runtime", () => {
     expect(concurrent.filter((result) => result.status === "rejected")).toHaveLength(1);
     adapter.complete(turn.request.agentId);
 
-    const finished = await service.waitForRunTerminal(run.id);
+    const finished = await waitForRunTerminal(service, run.id);
     expect(finished).toMatchObject({ status: "complete", reason: "returned" });
     const details = await service.inspectRun(run.id);
     expect(details.state.result).toBe("ordered result");
@@ -459,7 +519,7 @@ describe("WorkflowService runtime", () => {
       data: { value: "done" },
     });
     adapter.complete(repair.request.agentId);
-    await expect(service.waitForRunTerminal(run.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
       status: "complete",
     });
   });
@@ -475,7 +535,7 @@ describe("WorkflowService runtime", () => {
     protocolCase.adapter.complete(protocolCase.adapter.starts[0].request.agentId);
     await protocolCase.adapter.waitForStarts(2);
     protocolCase.adapter.complete(protocolCase.adapter.starts[1].request.agentId);
-    await expect(protocolCase.service.waitForRunTerminal(protocolRun.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(protocolCase.service, protocolRun.id)).resolves.toMatchObject({
       status: "complete",
       reason: expect.stringContaining("without one allowed workflow event"),
     });
@@ -488,7 +548,7 @@ describe("WorkflowService runtime", () => {
     });
     await agentCase.adapter.waitForStarts(1);
     agentCase.adapter.complete(agentCase.adapter.starts[0].request.agentId, "failed");
-    await expect(agentCase.service.waitForRunTerminal(agentRun.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(agentCase.service, agentRun.id)).resolves.toMatchObject({
       status: "complete",
       reason: "controlled failure",
     });
@@ -528,7 +588,7 @@ describe("WorkflowService runtime", () => {
         data: { value: "done" },
       });
       adapter.complete(second.request.agentId);
-      await expect(service.waitForRunTerminal(run.id)).resolves.toMatchObject({
+      await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
         status: "complete",
       });
       expect(adapter.agentCreates).toHaveLength(expectedCreates);
@@ -632,7 +692,7 @@ describe("WorkflowService runtime", () => {
     });
     adapter.complete(third.request.agentId);
 
-    await service.waitForRunTerminal(run.id);
+    await waitForRunTerminal(service, run.id);
     expect(adapter.workspaceCreates).toHaveLength(3);
     const details = await service.inspectRun(run.id);
     const result = details.state.result as Array<{ index: number; output: string }>;
@@ -699,7 +759,7 @@ describe("WorkflowService runtime", () => {
       });
       adapter.complete(turn.request.agentId);
     }
-    await expect(service.waitForRunTerminal(run.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
       status: "stopped",
       reason: "requested",
     });
@@ -714,7 +774,7 @@ describe("WorkflowService runtime", () => {
       message: "resumed",
     });
     adapter.complete(third.request.agentId);
-    await expect(service.waitForRunTerminal(run.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
       status: "complete",
     });
   });
@@ -727,11 +787,12 @@ describe("WorkflowService runtime", () => {
       context: { workspaceId: "workspace-root" },
     });
     await adapter.waitForStarts(1);
+    await waitForActiveTurnPhase(storage, run.id, "running");
     service.dispose();
     const failedState = await storage.readState(run.id);
     failedState.status = "failed";
     failedState.reason = "controlled failure";
-    await storage.saveState(run.id, failedState);
+    await storage.commitRunTransaction(run.id, { state: failedState, events: [] });
 
     await expect(service.resumeRun(run.id)).rejects.toThrow(
       `failed workflow runs cannot be resumed: ${run.id}`,
@@ -749,6 +810,7 @@ describe("WorkflowService runtime", () => {
       context: { workspaceId: "workspace-root" },
     });
     await firstProcess.adapter.waitForStarts(1);
+    await waitForActiveTurnPhase(firstProcess.storage, run.id, "running");
     const active = firstProcess.adapter.starts[0];
     firstProcess.service.dispose();
 
@@ -759,6 +821,8 @@ describe("WorkflowService runtime", () => {
       adapter: restartedAdapter,
     });
     await restartedService.initialize();
+    expect(restartedAdapter.reconciliations).toHaveLength(0);
+    await restartedService.start();
     await restartedAdapter.waitForReconciliations(1);
     await restartedService.emitEvent({
       callerAgentId: active.request.agentId,
@@ -768,7 +832,7 @@ describe("WorkflowService runtime", () => {
     });
     restartedAdapter.complete(active.request.agentId);
 
-    await expect(restartedService.waitForRunTerminal(run.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(restartedService, run.id)).resolves.toMatchObject({
       status: "complete",
       reason: "returned",
     });
@@ -778,7 +842,7 @@ describe("WorkflowService runtime", () => {
     expect(details.events.filter((event) => event.type === "event_accepted")).toHaveLength(1);
   });
 
-  it("reconciles a native submission that crashed before onStarted persisted its turn ID", async () => {
+  it("reconciles a native submission that crashed before its turn ID was persisted", async () => {
     const firstProcess = await setup(baseSpec());
     firstProcess.adapter.pauseAfterNativeSubmission = true;
     const run = await firstProcess.service.startRun({
@@ -808,6 +872,7 @@ describe("WorkflowService runtime", () => {
       adapter: restartedAdapter,
     });
     await restartedService.initialize();
+    await restartedService.start();
     await restartedAdapter.waitForReconciliations(1);
     await restartedService.emitEvent({
       callerAgentId: submitted.request.agentId,
@@ -817,7 +882,7 @@ describe("WorkflowService runtime", () => {
     });
     restartedAdapter.complete(submitted.request.agentId);
 
-    await expect(restartedService.waitForRunTerminal(run.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(restartedService, run.id)).resolves.toMatchObject({
       status: "complete",
       reason: "returned",
     });
@@ -862,7 +927,7 @@ describe("WorkflowService runtime", () => {
     });
     adapter.complete(active.request.agentId);
 
-    await expect(service.waitForRunTerminal(run.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
       status: "complete",
     });
     const details = await service.inspectRun(run.id);
@@ -903,7 +968,7 @@ describe("WorkflowService runtime", () => {
       data: { value: "complete" },
     });
     adapter.complete(finalTurn.request.agentId);
-    await expect(service.waitForRunTerminal(run.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
       status: "complete",
     });
   });
@@ -925,11 +990,15 @@ describe("WorkflowService runtime", () => {
       message: "would require another turn",
     });
     turnLimited.adapter.complete(first.request.agentId);
-    await expect(turnLimited.service.waitForRunTerminal(turnRun.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(turnLimited.service, turnRun.id)).resolves.toMatchObject({
       status: "stopped",
       reason: "max_iterations",
+      resumable: false,
     });
     expect(turnLimited.adapter.starts).toHaveLength(1);
+    await expect(turnLimited.service.resumeRun(turnRun.id)).rejects.toThrow(
+      `only user-stopped workflow runs can be resumed: ${turnRun.id}`,
+    );
 
     const terminalSpec = baseSpec();
     terminalSpec.limits = { maxIterations: 1, maxRuntime: "1h" };
@@ -948,7 +1017,7 @@ describe("WorkflowService runtime", () => {
       data: { value: "terminal" },
     });
     terminal.adapter.complete(only.request.agentId);
-    await expect(terminal.service.waitForRunTerminal(terminalRun.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(terminal.service, terminalRun.id)).resolves.toMatchObject({
       status: "complete",
       reason: "returned",
     });
@@ -960,10 +1029,11 @@ describe("WorkflowService runtime", () => {
       context: { workspaceId: "workspace-root" },
     });
     await runtime.adapter.waitForStarts(1);
+    await waitForActiveTurnPhase(runtime.storage, runtimeRun.id, "running");
     const runtimeTurn = runtime.adapter.starts[0];
     const state = await runtime.storage.readState(runtimeRun.id);
     state.startedAt = new Date(0).toISOString();
-    await runtime.storage.saveState(runtimeRun.id, state);
+    await runtime.storage.commitRunTransaction(runtimeRun.id, { state, events: [] });
     await runtime.service.emitEvent({
       callerAgentId: runtimeTurn.request.agentId,
       event: "done",
@@ -971,9 +1041,31 @@ describe("WorkflowService runtime", () => {
       data: { value: "late" },
     });
     runtime.adapter.complete(runtimeTurn.request.agentId);
-    await expect(runtime.service.waitForRunTerminal(runtimeRun.id)).resolves.toMatchObject({
+    await expect(waitForRunTerminal(runtime.service, runtimeRun.id)).resolves.toMatchObject({
       status: "stopped",
       reason: "max_runtime",
     });
+  });
+
+  it("schedules long runtime limits within Node's maximum timer delay", async () => {
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const spec = baseSpec();
+    spec.limits = { maxIterations: 10, maxRuntime: "25d" };
+    const { service, storage, adapter } = await setup(spec);
+
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Long-running work" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForStarts(1);
+    await waitForActiveTurnPhase(storage, run.id, "running");
+    service.dispose();
+
+    const delays = setTimeoutSpy.mock.calls
+      .map((call) => call[1])
+      .filter((delay): delay is number => typeof delay === "number");
+    expect(delays).toContain(2_147_483_647);
+    expect(delays.every((delay) => delay <= 2_147_483_647)).toBe(true);
   });
 });

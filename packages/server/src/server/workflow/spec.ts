@@ -4,8 +4,10 @@ import type {
   WorkflowValidationIssue,
   WorkflowValidationResult,
 } from "@getpaseo/protocol/workflow/types";
+import { canonicalJson, type JsonObject } from "./json.js";
+import { renderValue } from "./render.js";
 
-export type JsonObject = Record<string, unknown>;
+export { canonicalJson, type JsonObject } from "./json.js";
 
 export interface WorkflowCallerContext {
   workspaceId?: string;
@@ -52,8 +54,7 @@ const AGENT_NAME = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DURATION = /^[1-9][0-9]*(s|m|h|d)$/;
 const PARAMETER_REFERENCE = /parameters\.([A-Za-z_][A-Za-z0-9_]*)/g;
-const EXACT_PARAMETER = /^\s*{{\s*parameters\.([A-Za-z_][A-Za-z0-9_]*)\s*}}\s*$/;
-const INLINE_PARAMETER = /{{\s*parameters\.([A-Za-z_][A-Za-z0-9_]*)\s*}}/g;
+const EXACT_PARAMETER_REFERENCE = /^\s*{{\s*parameters\.([A-Za-z_][A-Za-z0-9_]*)\s*}}\s*$/;
 const Ajv2020Constructor = Ajv2020 as unknown as {
   new (options?: { strict?: boolean }): {
     compile: (schema: unknown) => (value: unknown) => boolean;
@@ -342,11 +343,7 @@ function validateWorkspace(value: unknown, path: string, issues: Issues): void {
     return;
   }
   const create = value.createWorktree;
-  issues.unknown(
-    create,
-    createPath,
-    new Set(["cwd", "name", "prefix", "branchPrefix", "namePrefix", "target"]),
-  );
+  issues.unknown(create, createPath, new Set(["cwd", "name", "target"]));
   if (typeof create.cwd !== "string" || create.cwd.length === 0) {
     issues.add(`${createPath}.cwd`, "must be a string");
   }
@@ -369,17 +366,6 @@ function validateWorkspace(value: unknown, path: string, issues: Issues): void {
     }
   } else {
     issues.add(`${targetPath}.mode`, "unknown mode");
-  }
-  for (const field of ["prefix", "branchPrefix"] as const) {
-    const item = create[field];
-    if (item !== undefined && (typeof item !== "string" || item.length === 0)) {
-      issues.add(`${createPath}.${field}`, "must be a lowercase string");
-    } else if (
-      typeof item === "string" &&
-      stripTemplates(item) !== stripTemplates(item).toLowerCase()
-    ) {
-      issues.add(`${createPath}.${field}`, "must be lowercase");
-    }
   }
 }
 
@@ -802,9 +788,10 @@ export function materializeWorkflowSpec(
     }
     resolved[name] = coerceParameter(name, rawDeclaration, value);
   }
-  const materialized = renderParameterTree(
+  const materialized = renderValue(
     Object.fromEntries(Object.entries(template).filter(([key]) => key !== "parameters")),
-    resolved,
+    { parameters: resolved },
+    { preserveUndefined: true },
   );
   if (!isObject(materialized)) {
     throw new Error("$: materialized spec must be an object");
@@ -876,47 +863,6 @@ function coerceNumber(path: string, value: unknown, integer: boolean): number {
   return number;
 }
 
-function renderParameterTree(value: unknown, parameters: JsonObject): unknown {
-  if (typeof value === "string") {
-    const exact = value.match(EXACT_PARAMETER);
-    if (exact) {
-      return parameters[exact[1]];
-    }
-    return value.replace(INLINE_PARAMETER, (_, name: string) =>
-      stringifyParameter(parameters[name]),
-    );
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => renderParameterTree(item, parameters));
-  }
-  if (isObject(value)) {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, renderParameterTree(item, parameters)]),
-    );
-  }
-  return value;
-}
-
-function stringifyParameter(value: unknown): string {
-  if (value === null || value === undefined) return "";
-  if (typeof value === "string") return value;
-  return canonicalJson(value);
-}
-
-export function canonicalJson(value: unknown): string {
-  return JSON.stringify(sortJson(value));
-}
-
-function sortJson(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortJson);
-  if (!isObject(value)) return value;
-  return Object.fromEntries(
-    Object.keys(value)
-      .sort()
-      .map((key) => [key, sortJson(value[key])]),
-  );
-}
-
 export function formatValidationIssues(issues: readonly WorkflowValidationIssue[]): string {
   return issues.map((issue) => `${issue.path}: ${issue.message}`).join("\n");
 }
@@ -929,10 +875,6 @@ function parameterType(
   ) as WorkflowValidationResult["parameters"][number]["type"];
 }
 
-function stripTemplates(value: string): string {
-  return value.replace(/{{.*?}}|{%.*?%}/g, "");
-}
-
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
@@ -942,7 +884,7 @@ function isPositiveIntegerOrParameter(value: unknown): boolean {
 }
 
 function isExactParameter(value: unknown): boolean {
-  return typeof value === "string" && EXACT_PARAMETER.test(value);
+  return typeof value === "string" && EXACT_PARAMETER_REFERENCE.test(value);
 }
 
 function isObject(value: unknown): value is JsonObject {

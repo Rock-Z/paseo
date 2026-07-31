@@ -10,12 +10,6 @@
       "title": "Repository",
       "description": "Repository cwd used when creating the Paseo worktree."
     },
-    "prefix": {
-      "type": "string",
-      "default": "workflow",
-      "title": "Worktree prefix",
-      "description": "Shared prefix for Paseo-generated branch and workspace names."
-    },
     "baseBranch": {
       "type": "string",
       "default": "main",
@@ -104,7 +98,6 @@
   "workspace": {
     "createWorktree": {
       "cwd": "{{ parameters.repoCwd }}",
-      "prefix": "{{ parameters.prefix }}",
       "target": {
         "mode": "branch-off",
         "base": "{{ parameters.baseBranch }}"

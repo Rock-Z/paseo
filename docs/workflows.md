@@ -71,41 +71,38 @@ $PASEO_HOME/workflows/
     ├── spec.json
     ├── state.json
     ├── events.jsonl
-    ├── rendered-prompts/
-    └── event-history/
+    └── rendered-prompts/
 ```
 
-`spec.json` is the fully materialized canonical JSON used by that run. State transitions, audit
-events, and accepted-event records commit through a per-run journal. Recovery finishes a journal
-idempotently before exposing the run, then removes it. `state.json` is replaced atomically and
-`events.jsonl` remains append-only. Rendered prompts and accepted-event records retain the workflow
-turn, native turn, agent, and flow identities needed for inspection and replay rejection. The run
-state retains active and completed turn identities plus agent and workspace control targets.
+`spec.json` is the fully materialized canonical JSON used by that run. Each state transition and its
+audit events commit through one per-run journal. Recovery finishes a journal idempotently before
+exposing the run, then removes it. `state.json` is replaced atomically and `events.jsonl` remains
+append-only. The state and audit log retain accepted events, rendered prompt references, active and
+completed turn identities, and agent and workspace control targets.
 
-On daemon startup, `WorkflowService` loads non-terminal intent and reconciles each recorded turn
-against the existing Paseo agent and its canonical timeline. It calls the normal
-`ensureAgentLoaded()` path; it does not restore provider sessions itself. A matching active turn is
-awaited, a matching completed turn is consumed, and only a missing turn can be launched. The agent
-identity and stable client message ID are durable before native submission, so queued and launching
-turns reconcile through the same timeline path even when the daemon exits before the native turn ID
-is recorded.
+After daemon listen and agent tool setup complete, `WorkflowService` loads non-terminal intent and
+reconciles each recorded turn against the existing Paseo agent and its canonical timeline. It calls
+the normal `ensureAgentLoaded()` path; it does not restore provider sessions itself. A matching
+active turn is awaited, a matching completed turn is consumed, and only a missing turn can be
+launched. The agent identity and stable client message ID are durable before native submission, so
+queued and launching turns reconcile through the same timeline path even when the daemon exits
+before the native turn ID is recorded.
 
 Historical `$PASEO_HOME/workflow-runs/{run-id}/spec.yaml` runs remain inspectable. The reader
 normalizes their state and audit records without mutating them. They remain non-resumable unless the
 native state contract can prove safe control ownership.
 
 Stop is graceful. It records intent, lets active native turns settle, and launches no new action.
-The run becomes `stopped` after active turns drain. Resume continues the persisted runnable state.
-Terminal `complete`, `failed`, and limit-stopped runs do not restart.
+The run becomes `stopped` after active turns drain. Only an explicitly user-stopped run can resume
+the persisted runnable state. Terminal `complete`, `failed`, and limit-stopped runs do not restart.
 
 ## Tool authorization
 
 `emit_event` is a native Paseo tool. Providers may expose the transport-neutral Paseo tool catalog
 through their own adapter; MCP injection is not required.
 
-Disabling **Enable Paseo tools** removes the operator catalog from agent sessions but leaves
-`emit_event` available. The event tool is inert outside an active workflow turn, so this exception
-does not grant ordinary agents access to agent, workspace, schedule, or workflow controls.
+Disabling **Enable Paseo tools** removes the complete catalog, including `emit_event`, from agent
+sessions. Workflows do not override this operator setting.
 
 The tool has no workflow capability token. `WorkflowService` resolves authorization from:
 

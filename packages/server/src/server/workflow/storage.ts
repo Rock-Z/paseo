@@ -12,15 +12,15 @@ import type {
 import { WorkflowEventRecordSchema } from "@getpaseo/protocol/workflow/types";
 import { parse as parseYaml } from "yaml";
 import { writeFileAtomic, writeJsonFileAtomic } from "../atomic-file.js";
-import { canonicalJson, type JsonObject, validateWorkflowTemplate } from "./spec.js";
-import { type WorkflowAcceptedEvent, WorkflowAcceptedEventSchema } from "./state.js";
+import { canonicalJson, type JsonObject } from "./json.js";
+import { validateWorkflowTemplate } from "./spec.js";
 
 const WORKFLOW_ID = /^[a-z0-9][a-z0-9-]*$/;
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const PENDING_COMMIT_FILE = "pending-commit.json";
 
 export interface WorkflowCommitBoundary {
-  step: "journal" | "event" | "accepted-event" | "state" | "journal-cleanup";
+  step: "journal" | "event" | "state" | "journal-cleanup";
   phase: "before" | "after";
   index?: number;
 }
@@ -28,10 +28,6 @@ export interface WorkflowCommitBoundary {
 export interface WorkflowRunTransaction {
   state: JsonObject;
   events: WorkflowEventRecord[];
-  acceptedEvents: Array<{
-    workflowTurnId: string;
-    event: WorkflowAcceptedEvent;
-  }>;
 }
 
 export interface WorkflowStorageOptions {
@@ -106,16 +102,9 @@ export class WorkflowStorage {
     throw new Error(`workflow spec not found: ${id}`);
   }
 
-  async saveUserSpec(value: unknown): Promise<JsonObject> {
-    const validation = validateWorkflowTemplate(value, "user");
-    if (!validation.valid || !validation.summary || !isObject(value)) {
-      const message = validation.issues
-        .map((issue) => `${issue.path}: ${issue.message}`)
-        .join("\n");
-      throw new Error(message || "invalid workflow spec");
-    }
-    const id = validation.summary.id;
+  async saveUserSpec(id: string, value: JsonObject): Promise<string> {
     assertWorkflowId(id);
+    if (value.name !== id) throw new Error(`workflow spec identity mismatch: ${id}`);
     const builtInPath = path.join(this.builtInDirectory, `${id}.json`);
     if (await exists(builtInPath)) {
       throw new Error(`built-in workflow specs cannot be replaced: ${id}`);
@@ -129,7 +118,7 @@ export class WorkflowStorage {
       filePath,
       `${JSON.stringify(JSON.parse(canonicalJson(value)), null, 2)}\n`,
     );
-    return value;
+    return (await fs.stat(filePath)).mtime.toISOString();
   }
 
   async createRun(
@@ -151,7 +140,6 @@ export class WorkflowStorage {
     try {
       await fs.mkdir(temporaryDirectory);
       await fs.mkdir(path.join(temporaryDirectory, "rendered-prompts"));
-      await fs.mkdir(path.join(temporaryDirectory, "event-history"));
       await writeFileAtomic(
         path.join(temporaryDirectory, "spec.json"),
         `${JSON.stringify(spec, null, 2)}\n`,
@@ -183,34 +171,6 @@ export class WorkflowStorage {
     }
   }
 
-  async saveState(runId: string, state: JsonObject): Promise<void> {
-    await this.recoverRun(runId);
-    const { directory, legacy } = await this.resolveRun(runId);
-    if (legacy) {
-      throw new Error(`legacy workflow state is read-only: ${runId}`);
-    }
-    const statePath = path.join(directory, "state.json");
-    await assertNotSymlink(statePath);
-    await writeJsonFileAtomic(statePath, state);
-  }
-
-  async appendEvent(runId: string, event: WorkflowEventRecord): Promise<void> {
-    await this.recoverRun(runId);
-    const { directory, legacy } = await this.resolveRun(runId);
-    if (legacy) {
-      throw new Error(`legacy workflow audit is read-only: ${runId}`);
-    }
-    const eventsPath = path.join(directory, "events.jsonl");
-    await assertNotSymlink(eventsPath);
-    const handle = await fs.open(eventsPath, "a");
-    try {
-      await handle.write(`${canonicalJson(event)}\n`);
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-  }
-
   async commitRunTransaction(runId: string, transaction: WorkflowRunTransaction): Promise<void> {
     assertRunId(runId);
     await this.withRunLock(runId, async () => {
@@ -224,7 +184,6 @@ export class WorkflowStorage {
         runId,
         state: transaction.state,
         events: transaction.events,
-        acceptedEvents: transaction.acceptedEvents,
       };
       const journalPath = path.join(directory, PENDING_COMMIT_FILE);
       await this.reachCommitBoundary({ step: "journal", phase: "before" });
@@ -247,34 +206,6 @@ export class WorkflowStorage {
     await assertDirectoryNotSymlink(promptDirectory);
     await writeFileAtomic(path.join(promptDirectory, name), prompt.content);
     return name;
-  }
-
-  async writeAcceptedEvent(
-    runId: string,
-    workflowTurnId: string,
-    event: {
-      event: string;
-      message: string;
-      data: unknown;
-      acceptedAt: string;
-      nativeTurnId: string;
-    },
-  ): Promise<void> {
-    await this.recoverRun(runId);
-    const { directory, legacy } = await this.resolveRun(runId);
-    if (legacy) {
-      throw new Error(`legacy workflow event history is read-only: ${runId}`);
-    }
-    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(workflowTurnId)) {
-      throw new Error(`invalid workflow turn id: ${workflowTurnId}`);
-    }
-    const historyDirectory = path.join(directory, "event-history");
-    await assertDirectoryNotSymlink(historyDirectory);
-    const filePath = path.join(historyDirectory, `${workflowTurnId}.json`);
-    if (await exists(filePath)) {
-      throw new Error(`workflow event was already accepted: ${workflowTurnId}`);
-    }
-    await writeJsonFileAtomic(filePath, event);
   }
 
   async inspectRun(runId: string): Promise<WorkflowRunDetails> {
@@ -382,7 +313,6 @@ export class WorkflowStorage {
     const statePath = path.join(directory, "state.json");
     await assertNotSymlink(eventsPath);
     await assertNotSymlink(statePath);
-    await assertDirectoryNotSymlink(path.join(directory, "event-history"));
     await repairPartialEventAppend(eventsPath, pending.events);
     for (const [index, event] of pending.events.entries()) {
       if (notifyBoundaries) {
@@ -391,23 +321,6 @@ export class WorkflowStorage {
       await appendEventIdempotently(eventsPath, event);
       if (notifyBoundaries) {
         await this.reachCommitBoundary({ step: "event", phase: "after", index });
-      }
-    }
-    for (const [index, accepted] of pending.acceptedEvents.entries()) {
-      if (notifyBoundaries) {
-        await this.reachCommitBoundary({
-          step: "accepted-event",
-          phase: "before",
-          index,
-        });
-      }
-      await writeAcceptedEventIdempotently(directory, accepted);
-      if (notifyBoundaries) {
-        await this.reachCommitBoundary({
-          step: "accepted-event",
-          phase: "after",
-          index,
-        });
       }
     }
     const auditSequence = (await readCanonicalEvents(eventsPath)).at(-1)?.seq ?? 0;
@@ -503,6 +416,7 @@ function summarizeRun(runId: string, state: JsonObject, legacy: boolean): Workfl
     legacy,
     resumable:
       status === "stopped" &&
+      reason === "requested" &&
       schemaVersion === "paseo.workflows.run.v0.2" &&
       isObject(state.instances),
     workspaceIds: [...workspaceIds],
@@ -639,27 +553,16 @@ function parsePendingCommit(value: unknown): PendingWorkflowCommit {
     value.schemaVersion !== "paseo.workflows.commit.v1" ||
     typeof value.runId !== "string" ||
     !isObject(value.state) ||
-    !Array.isArray(value.events) ||
-    !Array.isArray(value.acceptedEvents)
+    !Array.isArray(value.events)
   ) {
     throw new Error("invalid workflow commit journal");
   }
   const events = value.events.map((event) => WorkflowEventRecordSchema.parse(event));
-  const acceptedEvents = value.acceptedEvents.map((accepted) => {
-    if (!isObject(accepted) || typeof accepted.workflowTurnId !== "string") {
-      throw new Error("invalid accepted event in workflow commit journal");
-    }
-    return {
-      workflowTurnId: accepted.workflowTurnId,
-      event: WorkflowAcceptedEventSchema.parse(accepted.event),
-    };
-  });
   return {
     schemaVersion: "paseo.workflows.commit.v1",
     runId: value.runId,
     state: value.state,
     events,
-    acceptedEvents,
   };
 }
 
@@ -718,25 +621,6 @@ async function readCanonicalEvents(filePath: string): Promise<WorkflowEventRecor
     }
   }
   return events;
-}
-
-async function writeAcceptedEventIdempotently(
-  directory: string,
-  accepted: WorkflowRunTransaction["acceptedEvents"][number],
-): Promise<void> {
-  if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(accepted.workflowTurnId)) {
-    throw new Error(`invalid workflow turn id: ${accepted.workflowTurnId}`);
-  }
-  const filePath = path.join(directory, "event-history", `${accepted.workflowTurnId}.json`);
-  if (await exists(filePath)) {
-    await assertNotSymlink(filePath);
-    const existing = JSON.parse(await fs.readFile(filePath, "utf8")) as unknown;
-    if (canonicalJson(existing) !== canonicalJson(accepted.event)) {
-      throw new Error(`workflow event history conflicts for ${accepted.workflowTurnId}`);
-    }
-    return;
-  }
-  await writeJsonFileAtomic(filePath, accepted.event);
 }
 
 async function readJsonObject(filePath: string, label: string): Promise<JsonObject> {

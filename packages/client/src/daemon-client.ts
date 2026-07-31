@@ -535,10 +535,6 @@ export type WorkflowRunInspectPayload = Extract<
   SessionOutboundMessage,
   { type: "workflow.run.inspect.response" }
 >["payload"];
-export type WorkflowRunLogsPayload = Extract<
-  SessionOutboundMessage,
-  { type: "workflow.run.logs.response" }
->["payload"];
 export type WorkflowRunMutationPayload = Extract<
   SessionOutboundMessage,
   { type: "workflow.run.stop.response" }
@@ -789,11 +785,6 @@ export interface StartWorkflowOptions {
     workspaceId?: string;
     agentId?: string;
   };
-  requestId?: string;
-}
-export interface WorkflowRunLogsOptions {
-  runId: string;
-  afterSeq?: number;
   requestId?: string;
 }
 export interface CreateScheduleOptions {
@@ -5316,17 +5307,6 @@ export class DaemonClient {
     return this.sendNamespacedCorrelatedSessionRequest({
       requestId,
       message: { type: "workflow.run.inspect.request", runId },
-    });
-  }
-
-  async workflowRunLogs(options: WorkflowRunLogsOptions): Promise<WorkflowRunLogsPayload> {
-    return this.sendNamespacedCorrelatedSessionRequest({
-      requestId: options.requestId,
-      message: {
-        type: "workflow.run.logs.request",
-        runId: options.runId,
-        ...(options.afterSeq !== undefined ? { afterSeq: options.afterSeq } : {}),
-      },
     });
   }
 

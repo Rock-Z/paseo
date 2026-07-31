@@ -1,6 +1,5 @@
 import { z } from "zod";
 import {
-  WorkflowEventRecordSchema,
   WorkflowRunDetailsSchema,
   WorkflowRunSummarySchema,
   WorkflowSpecSummarySchema,
@@ -57,13 +56,6 @@ export const WorkflowRunInspectRequestSchema = z.object({
   type: z.literal("workflow.run.inspect.request"),
   requestId: z.string(),
   runId: WorkflowRunIdSchema,
-});
-
-export const WorkflowRunLogsRequestSchema = z.object({
-  type: z.literal("workflow.run.logs.request"),
-  requestId: z.string(),
-  runId: WorkflowRunIdSchema,
-  afterSeq: z.number().int().nonnegative().optional(),
 });
 
 export const WorkflowRunStopRequestSchema = z.object({
@@ -146,17 +138,6 @@ export const WorkflowRunInspectResponseSchema = z.object({
   }),
 });
 
-export const WorkflowRunLogsResponseSchema = z.object({
-  type: z.literal("workflow.run.logs.response"),
-  payload: z.object({
-    requestId: z.string(),
-    run: WorkflowRunSummarySchema.nullable(),
-    entries: z.array(WorkflowEventRecordSchema),
-    nextCursor: z.number().int().nonnegative(),
-    error: WorkflowErrorSchema,
-  }),
-});
-
 export const WorkflowRunStopResponseSchema = z.object({
   type: z.literal("workflow.run.stop.response"),
   payload: z.object({
@@ -182,7 +163,6 @@ export type WorkflowSpecValidateRequest = z.infer<typeof WorkflowSpecValidateReq
 export type WorkflowRunStartRequest = z.infer<typeof WorkflowRunStartRequestSchema>;
 export type WorkflowRunListRequest = z.infer<typeof WorkflowRunListRequestSchema>;
 export type WorkflowRunInspectRequest = z.infer<typeof WorkflowRunInspectRequestSchema>;
-export type WorkflowRunLogsRequest = z.infer<typeof WorkflowRunLogsRequestSchema>;
 export type WorkflowRunStopRequest = z.infer<typeof WorkflowRunStopRequestSchema>;
 export type WorkflowRunResumeRequest = z.infer<typeof WorkflowRunResumeRequestSchema>;
 export type WorkflowSpecListResponse = z.infer<typeof WorkflowSpecListResponseSchema>;
@@ -192,6 +172,5 @@ export type WorkflowSpecValidateResponse = z.infer<typeof WorkflowSpecValidateRe
 export type WorkflowRunStartResponse = z.infer<typeof WorkflowRunStartResponseSchema>;
 export type WorkflowRunListResponse = z.infer<typeof WorkflowRunListResponseSchema>;
 export type WorkflowRunInspectResponse = z.infer<typeof WorkflowRunInspectResponseSchema>;
-export type WorkflowRunLogsResponse = z.infer<typeof WorkflowRunLogsResponseSchema>;
 export type WorkflowRunStopResponse = z.infer<typeof WorkflowRunStopResponseSchema>;
 export type WorkflowRunResumeResponse = z.infer<typeof WorkflowRunResumeResponseSchema>;

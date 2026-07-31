@@ -135,7 +135,6 @@ import {
   createPaseoToolCatalog,
   type PaseoToolHostDependencies,
 } from "./agent/tools/paseo-tools.js";
-import { WORKFLOW_EVENT_TOOL_NAMES } from "./agent/tools/tool-scope.js";
 import type { PaseoToolRuntimeContext } from "./agent/tools/types.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { bootstrapWorkspaceRegistries } from "./workspace-registry-bootstrap.js";
@@ -1297,15 +1296,9 @@ export async function createPaseoDaemon(
   const createAgentToolCatalog = (runtime: PaseoToolRuntimeContext) =>
     createPaseoToolCatalog(createAgentToolHostDependencies(runtime));
   agentManager.setPaseoToolCatalogFactory(createAgentToolCatalog);
-  let operatorPaseoToolsEnabled = config.mcpInjectIntoAgents ?? true;
-  // The setting controls Paseo's operator catalog. emit_event remains available
-  // as a caller-and-turn-authorized workflow coordination primitive.
-  agentManager.setPaseoToolsEnabled(operatorPaseoToolsEnabled);
-  // Persisted workflow reconciliation may resume an agent turn immediately.
-  // Install native tools before initialization so the restored provider session
-  // receives the same catalog as a newly created session.
+  agentManager.setPaseoToolsEnabled(config.mcpInjectIntoAgents !== false);
   await workflowService.initialize();
-  logger.info({ elapsed: elapsed() }, "Workflow service initialized");
+  logger.info({ elapsed: elapsed() }, "Workflow storage initialized");
 
   const mcpEnabled = config.mcpEnabled ?? true;
   let agentMcpBaseUrl: string | null = null;
@@ -1315,7 +1308,6 @@ export async function createPaseoDaemon(
     const createAgentMcpSession = async (callerAgentId?: string) => {
       const agentMcpServer = await createAgentMcpServer(
         createAgentToolHostDependencies({ callerAgentId }),
-        operatorPaseoToolsEnabled ? {} : { toolNames: WORKFLOW_EVENT_TOOL_NAMES },
       );
 
       // Stateless mode: each HTTP request builds a fresh server + transport that is
@@ -1468,12 +1460,15 @@ export async function createPaseoDaemon(
           const logAndResolve = async () => {
             boundListenTarget = resolveBoundListenTarget(listenTarget, httpServer);
             const mcpBaseUrl = mcpEnabled ? createAgentMcpBaseUrl(boundListenTarget) : null;
-            agentMcpBaseUrl = mcpBaseUrl;
+            agentMcpBaseUrl = config.mcpInjectIntoAgents === false ? null : mcpBaseUrl;
             agentManager.setMcpBaseUrl(agentMcpBaseUrl);
+            agentManager.setPaseoToolsEnabled(config.mcpInjectIntoAgents !== false);
             daemonConfigStore.onFieldChange("mcp.injectIntoAgents", (value) => {
-              operatorPaseoToolsEnabled = value === true;
-              agentManager.setPaseoToolsEnabled(operatorPaseoToolsEnabled);
+              agentManager.setMcpBaseUrl(value ? mcpBaseUrl : null);
+              agentManager.setPaseoToolsEnabled(value !== false);
             });
+            await workflowService.start();
+            logger.info({ elapsed: elapsed() }, "Workflow service started");
             daemonConfigStore.onFieldChange("appendSystemPrompt", (value) => {
               agentManager.setAppendSystemPrompt(typeof value === "string" ? value : "");
             });

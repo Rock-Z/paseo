@@ -11,6 +11,7 @@ import type { CreatePaseoWorktreeWorkflowFn } from "../worktree-session.js";
 import { areEquivalentPaths } from "../../utils/path.js";
 import type {
   WorkflowRuntimeAdapter,
+  WorkflowStartedTurn,
   WorkflowTurnReconciliation,
   WorkflowTurnRequest,
   WorkflowTurnResult,
@@ -86,7 +87,6 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     runId: string;
     instanceId: string;
     create: JsonObject;
-    namingPrompt: string | null;
   }): Promise<WorkflowWorkspace> {
     const target = objectValue(input.create.target, "createWorktree.target");
     const mode = stringValue(target.mode, "createWorktree.target.mode");
@@ -95,9 +95,6 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
       cwd: stringValue(input.create.cwd, "createWorktree.cwd"),
       worktreeSlug: stableSlug,
       ...(typeof input.create.name === "string" ? { title: input.create.name } : {}),
-      ...(input.namingPrompt
-        ? { firstAgentContext: { prompt: input.namingPrompt, attachments: [] } }
-        : {}),
       ...worktreeTarget(mode, target),
     });
     return {
@@ -182,10 +179,7 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     }
   }
 
-  async startTurn(
-    request: WorkflowTurnRequest,
-    onStarted: (nativeTurnId: string) => Promise<void>,
-  ): Promise<WorkflowTurnResult> {
+  async beginTurn(request: WorkflowTurnRequest): Promise<WorkflowStartedTurn> {
     await this.loadAgent(request.agentId);
     let nativeTurnId: string | null = null;
     let resolveStarted!: (turnId: string) => void;
@@ -201,45 +195,41 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
       },
       { agentId: request.agentId },
     );
-    const settled = this.agentManager
+    const result = this.agentManager
       .runAgent(request.agentId, request.prompt, {
         clientMessageId: request.clientMessageId,
       })
       .then(
-        (result) => ({
-          kind: "result" as const,
-          result: {
-            agentId: request.agentId,
-            nativeTurnId,
-            status: result.canceled ? ("canceled" as const) : ("completed" as const),
-            lastMessage: result.finalText,
-            lastError: null,
-          },
+        (turnResult): WorkflowTurnResult => ({
+          agentId: request.agentId,
+          nativeTurnId,
+          status: turnResult.canceled ? "canceled" : "completed",
+          lastMessage: turnResult.finalText,
+          lastError: null,
         }),
-        (error) => ({
-          kind: "result" as const,
-          result: {
-            agentId: request.agentId,
-            nativeTurnId,
-            status: "failed" as const,
-            lastMessage: "",
-            lastError: errorMessage(error),
-          },
+        (error): WorkflowTurnResult => ({
+          agentId: request.agentId,
+          nativeTurnId,
+          status: "failed",
+          lastMessage: "",
+          lastError: errorMessage(error),
         }),
       );
-    try {
-      const first = await Promise.race([
-        started.then((turnId) => ({ kind: "started" as const, turnId })),
-        settled,
-      ]);
-      if (first.kind === "started") {
-        await onStarted(first.turnId);
-        return (await settled).result;
-      }
-      return first.result;
-    } finally {
+    const first = await Promise.race([
+      started.then((turnId) => ({ kind: "started" as const, turnId })),
+      result.then((turnResult) => ({ kind: "result" as const, turnResult })),
+    ]);
+    if (first.kind === "result") {
       unsubscribe();
+      return {
+        nativeTurnId: first.turnResult.nativeTurnId,
+        result: Promise.resolve(first.turnResult),
+      };
     }
+    return {
+      nativeTurnId: first.turnId,
+      result: result.finally(unsubscribe),
+    };
   }
 
   async reconcileTurn(input: {

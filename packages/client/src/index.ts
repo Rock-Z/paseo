@@ -27,8 +27,6 @@ import type {
   StartWorkflowOptions,
   WorkflowRunInspectPayload,
   WorkflowRunListPayload,
-  WorkflowRunLogsOptions,
-  WorkflowRunLogsPayload,
   WorkflowRunMutationPayload,
   WorkflowRunStartPayload,
   WorkflowSpecGetPayload,
@@ -44,7 +42,6 @@ export type {
   BrowserAutomationExecuteRequestMessage,
   BrowserAutomationExecuteResponseMessage,
   StartWorkflowOptions,
-  WorkflowRunLogsOptions,
   WebSocketFactory,
   WebSocketLike,
 } from "./daemon-client.js";
@@ -353,7 +350,6 @@ export interface PaseoWorkflowActions {
   start(options: StartWorkflowOptions): Promise<WorkflowRunStartPayload>;
   listRuns(requestId?: string): Promise<WorkflowRunListPayload>;
   inspect(runId: string, requestId?: string): Promise<WorkflowRunInspectPayload>;
-  logs(options: WorkflowRunLogsOptions): Promise<WorkflowRunLogsPayload>;
   stop(runId: string, requestId?: string): Promise<WorkflowRunMutationPayload>;
   resume(runId: string, requestId?: string): Promise<WorkflowRunMutationPayload>;
 }
@@ -436,7 +432,6 @@ export function createPaseoClient(config: PaseoClientConfig): PaseoClient {
       start: (options) => daemonClient.workflowRunStart(options),
       listRuns: (requestId) => daemonClient.workflowRunList(requestId),
       inspect: (runId, requestId) => daemonClient.workflowRunInspect(runId, requestId),
-      logs: (options) => daemonClient.workflowRunLogs(options),
       stop: (runId, requestId) => daemonClient.workflowRunStop(runId, requestId),
       resume: (runId, requestId) => daemonClient.workflowRunResume(runId, requestId),
     },

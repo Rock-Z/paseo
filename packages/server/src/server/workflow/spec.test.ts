@@ -144,12 +144,15 @@ describe("workflow spec validation and materialization", () => {
     const emits = turn.emits as Record<string, Record<string, unknown>>;
     emits.done.dataSchema = { type: "definitely-not-a-json-schema-type" };
     (spec.inputs as Record<string, unknown>).missing = "{{ parameters.notDeclared }}";
+    const workspace = spec.workspace as Record<string, Record<string, unknown>>;
+    workspace.createWorktree.prefix = "ignored-prefix";
 
     const result = validateWorkflowTemplate(spec);
     expect(result.valid).toBe(false);
     expect(result.issues.map((issue) => issue.path)).toEqual(
       expect.arrayContaining([
         "$.unexpected",
+        "workspace.createWorktree.prefix",
         "parameters.notDeclared",
         "flows.main.states.work.on.done",
         "flows.main.states.work.turn.emits.done.dataSchema",

@@ -19,6 +19,11 @@ export interface WorkflowTurnResult {
   lastError: string | null;
 }
 
+export interface WorkflowStartedTurn {
+  nativeTurnId: string | null;
+  result: Promise<WorkflowTurnResult>;
+}
+
 export type WorkflowTurnReconciliation =
   | {
       state: "active";
@@ -43,7 +48,6 @@ export interface WorkflowRuntimeAdapter {
     runId: string;
     instanceId: string;
     create: JsonObject;
-    namingPrompt: string | null;
   }): Promise<WorkflowWorkspace>;
   resolveBoundWorkspace(input: {
     workspaceId: string;
@@ -61,10 +65,7 @@ export interface WorkflowRuntimeAdapter {
     existingAgentId: string | null;
   }): Promise<string>;
   waitUntilAgentIdle(agentId: string): Promise<void>;
-  startTurn(
-    request: WorkflowTurnRequest,
-    onStarted: (nativeTurnId: string) => Promise<void>,
-  ): Promise<WorkflowTurnResult>;
+  beginTurn(request: WorkflowTurnRequest): Promise<WorkflowStartedTurn>;
   reconcileTurn(request: {
     agentId: string;
     nativeTurnId: string | null;

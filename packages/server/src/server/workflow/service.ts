@@ -9,6 +9,7 @@ import type {
 import Ajv2020 from "ajv/dist/2020.js";
 import type {
   WorkflowRuntimeAdapter,
+  WorkflowStartedTurn,
   WorkflowTurnReconciliation,
   WorkflowTurnResult,
 } from "./runtime-adapter.js";
@@ -38,6 +39,7 @@ const Ajv2020Constructor = Ajv2020 as unknown as {
     };
   };
 };
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 interface WorkflowServiceOptions {
   storage: WorkflowStorage;
@@ -63,10 +65,17 @@ interface EmitWorkflowEventInput {
 interface Transaction {
   state: WorkflowRunState;
   events: WorkflowEventRecord[];
-  acceptedEvents: Array<{
-    workflowTurnId: string;
-    event: WorkflowAcceptedEvent;
-  }>;
+}
+
+export class WorkflowSpecSaveError extends Error {
+  constructor(
+    message: string,
+    readonly validation: WorkflowValidationResult,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "WorkflowSpecSaveError";
+  }
 }
 
 export class WorkflowService {
@@ -77,6 +86,7 @@ export class WorkflowService {
   private readonly lockTails = new Map<string, Promise<void>>();
   private readonly limitTimers = new Map<string, NodeJS.Timeout>();
   private initialized = false;
+  private started = false;
   private disposed = false;
 
   constructor(options: WorkflowServiceOptions) {
@@ -88,6 +98,12 @@ export class WorkflowService {
     if (this.initialized) return;
     await this.storage.initialize();
     this.initialized = true;
+  }
+
+  async start(): Promise<void> {
+    this.requireInitialized();
+    if (this.started) return;
+    this.started = true;
     for (const run of await this.storage.listRuns()) {
       if (!run.legacy && ["queued", "running", "stopping"].includes(run.status)) {
         this.kick(run.id);
@@ -122,19 +138,20 @@ export class WorkflowService {
   }> {
     this.requireInitialized();
     const validation = validateWorkflowTemplate(spec, "user");
-    if (!validation.valid || !validation.summary) {
-      throw new Error(formatValidationIssues(validation.issues));
+    if (!validation.valid || !validation.summary || !isObject(spec)) {
+      throw new WorkflowSpecSaveError(formatValidationIssues(validation.issues), validation);
     }
-    const saved = await this.storage.saveUserSpec(spec);
-    const summary = (await this.storage.listSpecs()).find(
-      (candidate) => candidate.id === validation.summary?.id,
-    );
-    if (!summary) throw new Error("saved workflow spec could not be reloaded");
-    return { spec: saved, summary, validation: { ...validation, summary } };
+    try {
+      const updatedAt = await this.storage.saveUserSpec(validation.summary.id, spec);
+      const summary = { ...validation.summary, updatedAt };
+      return { spec, summary, validation: { ...validation, summary } };
+    } catch (error) {
+      throw new WorkflowSpecSaveError(errorMessage(error), validation, { cause: error });
+    }
   }
 
   async startRun(input: StartWorkflowRunInput): Promise<WorkflowRunSummary> {
-    this.requireInitialized();
+    this.requireStarted();
     const template = await this.storage.getSpec(input.workflowId);
     const caller = await this.adapter.resolveCallerContext(input.context ?? {});
     const { spec } = materializeWorkflowSpec(template, input.parameters ?? {}, caller);
@@ -181,19 +198,6 @@ export class WorkflowService {
     return this.storage.inspectRun(runId);
   }
 
-  async logs(
-    runId: string,
-    afterSeq = 0,
-  ): Promise<{ run: WorkflowRunSummary; entries: WorkflowEventRecord[]; nextCursor: number }> {
-    const details = await this.inspectRun(runId);
-    const entries = details.events.filter((event) => event.seq > afterSeq);
-    return {
-      run: details.run,
-      entries,
-      nextCursor: entries.at(-1)?.seq ?? afterSeq,
-    };
-  }
-
   async stopRun(runId: string): Promise<WorkflowRunSummary> {
     this.requireInitialized();
     await this.transact(runId, (tx) => {
@@ -229,6 +233,9 @@ export class WorkflowService {
       }
       if (tx.state.status !== "stopped") {
         throw new Error(`workflow run is not stopped: ${runId}`);
+      }
+      if (tx.state.reason !== "requested") {
+        throw new Error(`only user-stopped workflow runs can be resumed: ${runId}`);
       }
       tx.state.status = "running";
       tx.state.reason = null;
@@ -297,7 +304,6 @@ export class WorkflowService {
         nativeTurnId,
       };
       turn.acceptedEvent = accepted;
-      tx.acceptedEvents.push({ workflowTurnId: turn.workflowTurnId, event: accepted });
       queueEvent(tx, {
         type: "event_accepted",
         instanceId: active.instance.id,
@@ -310,16 +316,6 @@ export class WorkflowService {
         data,
       });
     });
-  }
-
-  async waitForRunTerminal(runId: string, timeoutMs = 10_000): Promise<WorkflowRunSummary> {
-    const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
-      const run = (await this.storage.inspectRun(runId)).run;
-      if (isTerminal(run.status)) return run;
-      await new Promise<void>((resolve) => setTimeout(resolve, 10));
-    }
-    throw new Error(`timed out waiting for workflow run ${runId}`);
   }
 
   private kick(runId: string): void {
@@ -416,7 +412,10 @@ export class WorkflowService {
       return;
     const remaining =
       durationSeconds(limits.maxRuntime) * 1000 - (Date.now() - Date.parse(state.startedAt));
-    const timer = setTimeout(() => this.kick(runId), Math.max(remaining, 1));
+    const timer = setTimeout(
+      () => this.kick(runId),
+      Math.min(Math.max(remaining, 1), MAX_TIMER_DELAY_MS),
+    );
     timer.unref();
     this.limitTimers.set(runId, timer);
   }
@@ -446,7 +445,6 @@ export class WorkflowService {
         runId,
         instanceId: instance.id,
         create,
-        namingPrompt: this.workspaceNamingPrompt(spec, instance),
       });
     }
     await this.transact(runId, (tx) => {
@@ -462,21 +460,6 @@ export class WorkflowService {
         details: { workspaceId: workspace.workspaceId, cwd: workspace.cwd },
       });
     });
-  }
-
-  private workspaceNamingPrompt(spec: JsonObject, instance: WorkflowInstance): string | null {
-    const flow = flowDefinition(spec, instance.flow);
-    const state = stateDefinition(flow, instance.state);
-    if (!isObject(state.turn)) return null;
-    const promptName = String(state.turn.prompt);
-    const prompts = objectField(spec, "prompts");
-    const template = prompts[promptName];
-    if (typeof template !== "string") return null;
-    try {
-      return renderPrompt(template, buildContext(spec, createPreviewState(spec), instance));
-    } catch {
-      return `${String(spec.description)}\n\nWorkflow inputs: ${JSON.stringify(instance.inputs)}`;
-    }
   }
 
   private async advanceInstance(runId: string, instanceId: string): Promise<void> {
@@ -621,42 +604,76 @@ export class WorkflowService {
       existingAgentId: existing,
     });
     await this.adapter.waitUntilAgentIdle(agentId);
-    await this.transact(runId, (tx) => {
-      const active = requireActiveTurn(tx.state, instanceId, turn.workflowTurnId);
-      active.agentId = agentId;
-      active.phase = "launching";
-      const role = requireRole(requireInstance(tx.state, instanceId), active.agent);
-      role.agentId = agentId;
-      role.status = "running";
-    });
     const prompt = (await this.storage.inspectRun(runId)).prompts.find(
       (candidate) => candidate.name === turn.promptPath,
     )?.content;
     if (prompt === undefined) throw new Error(`rendered prompt is missing: ${turn.promptPath}`);
-    const result = await this.adapter.startTurn(
-      {
-        runId,
-        workflowTurnId: turn.workflowTurnId,
-        clientMessageId: turn.clientMessageId,
-        instanceId,
-        agentId,
-        prompt,
-        labels: {
-          "paseo.workflow.name": state.workflow.name,
-          "paseo.workflow.run": runId,
-          "paseo.workflow.instance": instanceId,
-          "paseo.workflow.flow": instance.flow,
-          "paseo.workflow.agent": turn.agent,
-          "paseo.workflow.iteration": String(turn.iteration),
-        },
+    const started = await this.beginTurnIfAllowed(runId, instanceId, turn.workflowTurnId, agentId, {
+      runId,
+      workflowTurnId: turn.workflowTurnId,
+      clientMessageId: turn.clientMessageId,
+      instanceId,
+      agentId,
+      prompt,
+      labels: {
+        "paseo.workflow.name": state.workflow.name,
+        "paseo.workflow.run": runId,
+        "paseo.workflow.instance": instanceId,
+        "paseo.workflow.flow": instance.flow,
+        "paseo.workflow.agent": turn.agent,
+        "paseo.workflow.iteration": String(turn.iteration),
       },
-      async (nativeTurnId) => {
-        await this.transact(runId, (tx) => {
-          recordTurnStarted(tx, instanceId, turn.workflowTurnId, nativeTurnId);
+    });
+    if (!started) return;
+    await this.completeTurn(runId, instanceId, await started.result);
+  }
+
+  private async beginTurnIfAllowed(
+    runId: string,
+    instanceId: string,
+    workflowTurnId: string,
+    agentId: string,
+    request: Parameters<WorkflowRuntimeAdapter["beginTurn"]>[0],
+  ): Promise<WorkflowStartedTurn | null> {
+    return this.withLock(runId, async () => {
+      const state = parseState(await this.storage.readState(runId));
+      const instance = requireInstance(state, instanceId);
+      const active = instance.activeTurn;
+      if (!active || active.workflowTurnId !== workflowTurnId) return null;
+      const tx: Transaction = { state, events: [] };
+      const role = requireRole(instance, active.agent);
+      active.agentId = agentId;
+      role.agentId = agentId;
+      if (state.stopRequested) {
+        instance.activeTurn = null;
+        instance.status = "runnable";
+        role.status = "idle";
+        queueEvent(tx, {
+          type: "turn_not_started",
+          instanceId,
+          flow: active.flow,
+          state: active.state,
+          agent: active.agent,
+          agentId,
+          details: { workflowTurnId, reason: "stop_requested" },
         });
-      },
-    );
-    await this.completeTurn(runId, instanceId, result);
+        finalizeRequestedStop(tx);
+        await this.commitTransaction(runId, tx);
+        return null;
+      }
+      active.phase = "launching";
+      role.status = "running";
+      await this.commitTransaction(runId, tx);
+
+      const started = await this.adapter.beginTurn(request);
+      if (started.nativeTurnId) {
+        const startedState = parseState(await this.storage.readState(runId));
+        const startedTx: Transaction = { state: startedState, events: [] };
+        recordTurnStarted(startedTx, instanceId, workflowTurnId, started.nativeTurnId);
+        await this.commitTransaction(runId, startedTx);
+      }
+      return started;
+    });
   }
 
   private async consumeReconciliation(
@@ -936,15 +953,18 @@ export class WorkflowService {
   ): Promise<T> {
     return this.withLock(runId, async () => {
       const state = parseState(await this.storage.readState(runId));
-      const transaction: Transaction = { state, events: [], acceptedEvents: [] };
+      const transaction: Transaction = { state, events: [] };
       const result = await callback(transaction);
-      state.updatedAt = new Date().toISOString();
-      await this.storage.commitRunTransaction(runId, {
-        state: state as unknown as JsonObject,
-        events: transaction.events,
-        acceptedEvents: transaction.acceptedEvents,
-      });
+      await this.commitTransaction(runId, transaction);
       return result;
+    });
+  }
+
+  private async commitTransaction(runId: string, transaction: Transaction): Promise<void> {
+    transaction.state.updatedAt = new Date().toISOString();
+    await this.storage.commitRunTransaction(runId, {
+      state: transaction.state as unknown as JsonObject,
+      events: transaction.events,
     });
   }
 
@@ -971,6 +991,11 @@ export class WorkflowService {
 
   private requireInitialized(): void {
     if (!this.initialized) throw new Error("WorkflowService is not initialized");
+  }
+
+  private requireStarted(): void {
+    this.requireInitialized();
+    if (!this.started) throw new Error("WorkflowService is not started");
   }
 }
 
@@ -1294,27 +1319,6 @@ function buildContext(
     context.item = instance.task.item;
   }
   return context;
-}
-
-function createPreviewState(spec: JsonObject): WorkflowRunState {
-  return {
-    schemaVersion: "paseo.workflows.run.v0.2",
-    runId: "preview",
-    workflow: { id: stringField(spec, "name"), name: stringField(spec, "name") },
-    status: "queued",
-    reason: null,
-    stopRequested: false,
-    pendingTerminal: null,
-    createdAt: new Date(0).toISOString(),
-    updatedAt: new Date(0).toISOString(),
-    startedAt: null,
-    completedAt: null,
-    loop: { iteration: 0, elapsedSeconds: 0 },
-    eventSeq: 0,
-    nextInstance: 1,
-    instances: {},
-    result: null,
-  };
 }
 
 function routingPrompt(emits: JsonObject): string {

@@ -212,10 +212,11 @@ async function readLogs(
   _command: Command,
 ): Promise<ListResult<Record<string, unknown>>> {
   return withClient(options, async (client) => {
-    const payload = requirePayload(await client.workflowRunLogs({ runId }));
+    const payload = requirePayload(await client.workflowRunInspect(runId));
+    if (!payload.details) throw new Error(`workflow run not found: ${runId}`);
     return {
       type: "list",
-      data: payload.entries,
+      data: payload.details.events,
       schema: eventSchema,
     };
   });

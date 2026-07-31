@@ -1,5 +1,5 @@
 import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
-import type { WorkflowService } from "./service.js";
+import { type WorkflowService, WorkflowSpecSaveError } from "./service.js";
 
 interface WorkflowSessionHost {
   emit(message: SessionOutboundMessage): void;
@@ -27,8 +27,6 @@ export class WorkflowSession {
         return this.listRuns(message.requestId);
       case "workflow.run.inspect.request":
         return this.inspectRun(message.requestId, message.runId);
-      case "workflow.run.logs.request":
-        return this.logs(message.requestId, message.runId, message.afterSeq);
       case "workflow.run.stop.request":
         return this.stopRun(message.requestId, message.runId);
       case "workflow.run.resume.request":
@@ -70,7 +68,6 @@ export class WorkflowSession {
   }
 
   private async saveSpec(requestId: string, spec: Record<string, unknown>): Promise<void> {
-    const validation = this.service.validateSpec(spec);
     try {
       const saved = await this.service.saveSpec(spec);
       this.host.emit({
@@ -90,7 +87,10 @@ export class WorkflowSession {
           requestId,
           spec: null,
           summary: null,
-          validation,
+          validation:
+            error instanceof WorkflowSpecSaveError
+              ? error.validation
+              : { valid: false, issues: [], summary: null, parameters: [] },
           error: errorMessage(error),
         },
       });
@@ -165,27 +165,6 @@ export class WorkflowSession {
       this.host.emit({
         type: "workflow.run.inspect.response",
         payload: { requestId, details: null, error: errorMessage(error) },
-      });
-    }
-  }
-
-  private async logs(requestId: string, runId: string, afterSeq?: number): Promise<void> {
-    try {
-      const result = await this.service.logs(runId, afterSeq);
-      this.host.emit({
-        type: "workflow.run.logs.response",
-        payload: { requestId, ...result, error: null },
-      });
-    } catch (error) {
-      this.host.emit({
-        type: "workflow.run.logs.response",
-        payload: {
-          requestId,
-          run: null,
-          entries: [],
-          nextCursor: afterSeq ?? 0,
-          error: errorMessage(error),
-        },
       });
     }
   }
