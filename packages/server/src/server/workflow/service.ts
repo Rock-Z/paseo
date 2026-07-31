@@ -586,7 +586,7 @@ export class WorkflowService {
         prompt: promptName,
         promptPath,
         attempt: repair?.attempt ?? 1,
-        phase: "queued",
+        phase: "provisioning",
         agentId: repair?.agentId ?? null,
         nativeTurnId: null,
         allowedEvents: Object.keys(emits),
@@ -645,7 +645,7 @@ export class WorkflowService {
     const agentDefinition = objectField(objectField(spec, "agents"), current.agent);
     const roleState = requireRole(instance, current.agent);
     const persistence = String(agentDefinition.persistence);
-    const existing = current.agentId ?? (persistence === "reuse-agent" ? roleState.agentId : null);
+    const existing = current.agentId ?? roleState.agentId;
     const agentId = await this.adapter.ensureAgent({
       runId,
       workflowName: state.workflow.name,
@@ -658,6 +658,7 @@ export class WorkflowService {
       workspace: instance.workspace,
       existingAgentId: existing,
     });
+    if (!(await this.bindEnsuredAgent(runId, instanceId, turn.workflowTurnId, agentId))) return;
     await this.adapter.waitUntilAgentIdle(agentId);
     const prompt = await this.storage.readRenderedPrompt(runId, turn.promptPath);
     const started = await this.withAgentLock(agentId, async () => {
@@ -687,6 +688,53 @@ export class WorkflowService {
       });
     }
     await this.completeTurn(runId, instanceId, await started.result);
+  }
+
+  private async bindEnsuredAgent(
+    runId: string,
+    instanceId: string,
+    workflowTurnId: string,
+    agentId: string,
+  ): Promise<boolean> {
+    let shouldContinue = false;
+    await this.transact(runId, (tx) => {
+      const instance = requireInstance(tx.state, instanceId);
+      const active = instance.activeTurn;
+      if (!active || active.workflowTurnId !== workflowTurnId) return;
+      if (active.agentId && active.agentId !== agentId) {
+        throw new Error(`native agent identity changed for ${workflowTurnId}`);
+      }
+      const role = requireRole(instance, active.agent);
+      if (role.agentId && role.agentId !== agentId) {
+        throw new Error(`workflow role agent identity changed for ${workflowTurnId}`);
+      }
+      const newlyBound = active.agentId !== agentId;
+      active.agentId = agentId;
+      active.phase = "queued";
+      role.agentId = agentId;
+      if (newlyBound) {
+        queueEvent(tx, {
+          type: "agent_ready",
+          instanceId,
+          flow: active.flow,
+          state: active.state,
+          agent: active.agent,
+          agentId,
+          details: { workflowTurnId },
+        });
+      }
+      if (tx.state.stopRequested) {
+        const reason =
+          tx.state.reason === "requested"
+            ? "stop_requested"
+            : (tx.state.reason ?? "stop_requested");
+        cancelQueuedTurns(tx, reason);
+        finalizeRequestedStop(tx);
+        return;
+      }
+      shouldContinue = true;
+    });
+    return shouldContinue;
   }
 
   private async startTurnIfAllowed(

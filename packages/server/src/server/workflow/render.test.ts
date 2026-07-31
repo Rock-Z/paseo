@@ -45,6 +45,12 @@ describe("workflow rendering", () => {
     expect(() => renderPrompt("{{ event.data.missing }}", context)).toThrow(
       "undefined workflow value",
     );
+    expect(() => renderPrompt("{{ inputs.constructor }}", { inputs: {} })).toThrow(
+      "undefined workflow value",
+    );
+    expect(() => renderPrompt("{{ inputs.__proto__ }}", { inputs: {} })).toThrow(
+      "undefined workflow value",
+    );
     expect(() => renderPrompt("{% for item in inputs %}x{% endfor %}", context)).toThrow(
       "unsupported workflow template tag",
     );

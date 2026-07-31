@@ -38,6 +38,7 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
   validationCalls = 0;
   validateGate: Promise<void> = Promise.resolve();
   workspaceGate: Promise<void> = Promise.resolve();
+  ensureGate: Promise<void> = Promise.resolve();
   idleGate: Promise<void> = Promise.resolve();
   pauseAfterNativeSubmission = false;
   workspaceFailure: { instanceId: string; afterStarts: number; message: string } | null = null;
@@ -52,6 +53,7 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
   private reconciliationWaiters: Array<() => void> = [];
   private validationWaiters: Array<() => void> = [];
   private workspaceWaiters: Array<() => void> = [];
+  private agentCreateWaiters: Array<() => void> = [];
 
   async resolveCallerContext(input: {
     workspaceId?: string;
@@ -104,6 +106,8 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     if (input.existingAgentId) return input.existingAgentId;
     const agentId = `agent-${this.nextAgent++}`;
     this.agentCreates.push({ instanceId: input.instanceId, role: input.role, agentId });
+    for (const resolve of this.agentCreateWaiters.splice(0)) resolve();
+    await this.ensureGate;
     return agentId;
   }
 
@@ -207,6 +211,12 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     if (this.workspaceCreates.length >= count) return;
     await new Promise<void>((resolve) => this.workspaceWaiters.push(resolve));
     if (this.workspaceCreates.length < count) await this.waitForWorkspaceCreates(count);
+  }
+
+  async waitForAgentCreates(count: number): Promise<void> {
+    if (this.agentCreates.length >= count) return;
+    await new Promise<void>((resolve) => this.agentCreateWaiters.push(resolve));
+    if (this.agentCreates.length < count) await this.waitForAgentCreates(count);
   }
 
   complete(agentId: string, status: WorkflowTurnResult["status"] = "completed"): void {
@@ -365,7 +375,7 @@ async function waitForRunStatus(
 async function waitForActiveTurnPhase(
   storage: WorkflowStorage,
   runId: string,
-  phase: "queued" | "launching" | "running",
+  phase: "provisioning" | "queued" | "launching" | "running",
 ): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < 10_000) {
@@ -609,6 +619,66 @@ describe("WorkflowService runtime", () => {
     const details = await service.inspectRun(run.id);
     expect(details.run).toMatchObject({ status: "stopped", reason: "requested" });
     expect(details.events.filter((event) => event.type === "workspace_ready")).toHaveLength(0);
+  });
+
+  it("drains agent provisioning, records its identity, and reuses it after stop and resume", async () => {
+    const spec = baseSpec();
+    const worker = (spec.agents as JsonObject).worker as JsonObject;
+    worker.persistence = "fresh-agent";
+    const { service, storage, adapter } = await setup(spec);
+    let releaseEnsure!: () => void;
+    adapter.ensureGate = new Promise<void>((resolve) => {
+      releaseEnsure = resolve;
+    });
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Reuse provisioned identity" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForAgentCreates(1);
+    const agentId = adapter.agentCreates[0].agentId;
+
+    await expect(service.stopRun(run.id)).resolves.toMatchObject({ status: "stopping" });
+    expect(adapter.starts).toHaveLength(0);
+    releaseEnsure();
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
+      status: "stopped",
+      reason: "requested",
+      agentIds: [agentId],
+    });
+    const stopped = await service.inspectRun(run.id);
+    expect(stopped.events).toContainEqual(
+      expect.objectContaining({
+        type: "agent_ready",
+        agentId,
+        details: expect.objectContaining({
+          workflowTurnId: expect.any(String),
+        }),
+      }),
+    );
+    expect(stopped.events).toContainEqual(
+      expect.objectContaining({
+        type: "turn_not_started",
+        agentId,
+        details: expect.objectContaining({ reason: "stop_requested" }),
+      }),
+    );
+    expect(adapter.starts).toHaveLength(0);
+
+    await service.resumeRun(run.id);
+    await adapter.waitForStarts(1);
+    expect(adapter.agentCreates).toHaveLength(1);
+    expect(adapter.starts[0].request.agentId).toBe(agentId);
+    await service.emitEvent({
+      callerAgentId: agentId,
+      event: "done",
+      data: { value: "complete" },
+    });
+    adapter.complete(agentId);
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
+      status: "complete",
+    });
+    expect((await storage.readState(run.id)).status).toBe("complete");
   });
 
   it("applies a runtime deadline while native workspace provisioning is blocked", async () => {
@@ -948,7 +1018,7 @@ describe("WorkflowService runtime", () => {
               join: "all",
               concurrency: 2,
             },
-            on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+            on: { joined: "finish" },
           },
           finish: { return: { output: "{{ event.data.results }}" } },
           failed: { stop: { reason: "{{ event.message }}" } },
@@ -1214,7 +1284,7 @@ describe("WorkflowService runtime", () => {
               join: "all",
               concurrency: 2,
             },
-            on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+            on: { joined: "finish" },
           },
           finish: { return: { output: "{{ event.data.results }}" } },
           failed: { stop: { reason: "{{ event.message }}" } },
@@ -1321,7 +1391,7 @@ describe("WorkflowService runtime", () => {
               join: "all",
               concurrency: 2,
             },
-            on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+            on: { joined: "finish" },
           },
           finish: { return: { output: "{{ event.data.results }}" } },
           failed: { stop: { reason: "{{ event.message }}" } },
@@ -1411,7 +1481,7 @@ describe("WorkflowService runtime", () => {
               join: "all",
               concurrency: 2,
             },
-            on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+            on: { joined: "finish" },
           },
           finish: { return: { output: "{{ event.data.results }}" } },
           failed: { stop: { reason: "{{ event.message }}" } },

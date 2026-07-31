@@ -130,6 +130,8 @@ function WorkflowHostScreen({
   const [action, setAction] = useState<ActionStatus>({ kind: "idle" });
   const [editorOpen, setEditorOpen] = useState(false);
   const [editor, setEditor] = useState("");
+  const [editorSavePending, setEditorSavePending] = useState(false);
+  const editorSavePendingRef = useRef(false);
   const loadRequestRef = useRef(0);
   const selectedRunIdRef = useRef<string | null>(null);
   const detailsRequestRef = useRef(0);
@@ -306,7 +308,9 @@ function WorkflowHostScreen({
   }, [client, editor]);
 
   const saveEditor = useCallback(async () => {
-    if (!client) return;
+    if (!client || editorSavePendingRef.current) return;
+    editorSavePendingRef.current = true;
+    setEditorSavePending(true);
     setAction({ kind: "pending", message: "Saving workflow definition…" });
     try {
       const payload = await client.workflowSpecSave(parseEditor(editor));
@@ -323,6 +327,9 @@ function WorkflowHostScreen({
       await load(true);
     } catch (error) {
       setAction({ kind: "error", message: errorMessage(error) });
+    } finally {
+      editorSavePendingRef.current = false;
+      setEditorSavePending(false);
     }
   }, [client, editor, load, selectedSpec]);
 
@@ -448,6 +455,7 @@ function WorkflowHostScreen({
                 onChange={setEditor}
                 onValidate={validateEditor}
                 onSave={saveEditor}
+                pending={editorSavePending}
               />
             ) : null}
             <View style={styles.list}>
@@ -522,17 +530,19 @@ function WorkflowEditor({
   onChange,
   onValidate,
   onSave,
+  pending,
 }: {
   value: string;
   onChange: (value: string) => void;
   onValidate: () => Promise<void>;
   onSave: () => Promise<void>;
+  pending: boolean;
 }): ReactElement {
   return (
     <View style={styles.card} testID="workflow-json-editor">
       <View style={styles.cardHeader}>
         <Text style={styles.cardTitle}>Import workflow JSON</Text>
-        <WorkflowJsonImport onLoad={onChange} />
+        <WorkflowJsonImport onLoad={onChange} disabled={pending} />
       </View>
       <SettingsTextAreaCard
         accessibilityLabel="Workflow JSON"
@@ -541,12 +551,19 @@ function WorkflowEditor({
         placeholder="Paste one paseo.workflows/v0.2 JSON object"
         testID="workflow-json-input"
         style={styles.jsonEditor}
+        editable={!pending}
       />
       <View style={styles.actionRow}>
-        <Button variant="outline" size="sm" onPress={onValidate} testID="workflow-json-validate">
+        <Button
+          variant="outline"
+          size="sm"
+          onPress={onValidate}
+          disabled={pending}
+          testID="workflow-json-validate"
+        >
           Validate
         </Button>
-        <Button size="sm" onPress={onSave} testID="workflow-json-save">
+        <Button size="sm" onPress={onSave} disabled={pending} testID="workflow-json-save">
           Save
         </Button>
       </View>

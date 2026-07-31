@@ -27,7 +27,7 @@ export const WorkflowActiveTurnSchema = z.object({
   prompt: z.string(),
   promptPath: z.string(),
   attempt: z.number().int().positive(),
-  phase: z.enum(["queued", "launching", "running"]),
+  phase: z.enum(["provisioning", "queued", "launching", "running"]),
   agentId: z.string().nullable(),
   nativeTurnId: z.string().nullable(),
   allowedEvents: z.array(z.string()),

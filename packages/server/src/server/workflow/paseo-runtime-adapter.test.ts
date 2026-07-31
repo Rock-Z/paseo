@@ -314,6 +314,57 @@ describe("PaseoWorkflowRuntimeAdapter", () => {
     expect(createPaseoWorktree).toHaveBeenCalledOnce();
   });
 
+  it("recovers a provisioned native agent by its stable workflow labels", async () => {
+    const existing = {
+      id: "agent-provisioned",
+      workspaceId: "workspace-1",
+      cwd: process.cwd(),
+    };
+    const createAgent = vi.fn();
+    const adapter = new PaseoWorkflowRuntimeAdapter({
+      agentManager: { getAgent: vi.fn(() => existing) } as never,
+      agentStorage: {
+        list: vi.fn(async () => [
+          {
+            id: existing.id,
+            archivedAt: null,
+            labels: {
+              "paseo.workflow.name": "durable-workflow",
+              "paseo.workflow.run": "run-durable",
+              "paseo.workflow.instance": "root",
+              "paseo.workflow.flow": "main",
+              "paseo.workflow.agent": "worker",
+              "paseo.workflow.agent-key": "turn-durable",
+            },
+          },
+        ]),
+      } as never,
+      providerSnapshotManager: {} as never,
+      workspaceRegistry: {} as never,
+      createAgent: createAgent as never,
+      createPaseoWorktree: (() => undefined) as never,
+      logger: {} as never,
+    });
+
+    await expect(
+      adapter.ensureAgent({
+        runId: "run-durable",
+        workflowName: "durable-workflow",
+        instanceId: "root",
+        flow: "main",
+        role: "worker",
+        agentKey: "turn-durable",
+        create: {},
+        workspace: {
+          workspaceId: existing.workspaceId,
+          cwd: existing.cwd,
+        },
+        existingAgentId: null,
+      }),
+    ).resolves.toBe(existing.id);
+    expect(createAgent).not.toHaveBeenCalled();
+  });
+
   it("does not validate unused create-agent fallback data for a bound role", async () => {
     const getProvider = vi.fn(async () => {
       throw new Error("fallback provider is unavailable");

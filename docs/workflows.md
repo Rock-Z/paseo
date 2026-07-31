@@ -55,13 +55,16 @@ Count and pull-request-number fields accept positive integer literals or paramet
 `turn` routing accepts only a named `emit_event` tool call declared by that state. The event message
 becomes `event.message`; optional data is checked against the event's JSON Schema and becomes
 `event.data`. Invalid, missing, stale, unauthorized, and duplicate events do not route the flow.
-Protocol failures can retry the same turn up to the declared repair limit, then use the
-`error.protocol` route. Agent failures use `error.agent`. There is no prose or sentinel routing.
-`maxRuntime` stops the run through the limit path; it is not a routable action error.
+Protocol failures can retry the same turn up to the declared repair limit, then use that turn's
+`error.protocol` route. Agent failures use that turn's `error.agent` route. There is no prose or
+sentinel routing. `maxRuntime` stops the run through the limit path; it is not a routable action
+error.
 
 `call` starts a nested flow. `map` starts one child flow per item, honors its concurrency bound, and
-joins results in input order. A child may reuse the parent workspace or create an isolated Paseo
-worktree. Agent reuse is local to the flow instance; `fresh-agent` creates a new agent for each turn.
+joins results in input order. Call and map states route only `returned` and `joined`; failures route
+inside child turn states or fail the run. A child may reuse the parent workspace or create an
+isolated Paseo worktree. Agent reuse is local to the flow instance; `fresh-agent` creates a new agent
+for each turn.
 
 Optional event data uses standard JSON Schema and is compiled during spec validation in
 `packages/server/src/server/workflow/spec.ts`.

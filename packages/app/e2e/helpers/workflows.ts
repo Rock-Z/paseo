@@ -214,8 +214,6 @@ export function buildFanoutWorkflow(name: string): JsonObject {
             },
             on: {
               joined: "finish",
-              "error.agent": "failed",
-              "error.timeout": "failed",
             },
           },
           finish: { return: { output: "{{ event.data.results }}" } },

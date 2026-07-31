@@ -139,7 +139,7 @@ function tryResolvePath(
 ): { found: true; value: unknown } | { found: false } {
   let current: unknown = context;
   for (const part of expression.split(".")) {
-    if (!isJsonObject(current) || !(part in current)) {
+    if (!isJsonObject(current) || !Object.prototype.hasOwnProperty.call(current, part)) {
       return { found: false };
     }
     current = current[part];

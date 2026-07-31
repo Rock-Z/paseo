@@ -309,6 +309,51 @@ test.describe("Native workflows", () => {
     }
   });
 
+  test("locks the JSON editor while a definition save is pending", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-save-lock-" });
+    const name = uniqueWorkflowName("save-lock");
+    let saveResponses = 0;
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      gate = await delayWorkflowResponse(page, isWorkflowSpecSaveResponse, {
+        onServerMessage: (message) => {
+          if (isWorkflowSpecSaveResponse(message)) saveResponses += 1;
+        },
+      });
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByTestId("workflows-new-json")).toBeVisible({
+        timeout: 30_000,
+      });
+      await page.getByTestId("workflows-new-json").click();
+      const editor = page.getByLabel("Workflow JSON");
+      const save = page.getByTestId("workflow-json-save");
+      await editor.fill(JSON.stringify(buildSingleTurnWorkflow({ name, delayMs: 0 })));
+      await save.click();
+      await gate.waitForDelayedResponse();
+
+      await expect(editor).not.toBeEditable();
+      await expect(page.getByTestId("workflow-import-file")).toBeDisabled();
+      await expect(page.getByTestId("workflow-json-validate")).toBeDisabled();
+      await expect(save).toBeDisabled();
+      await save.dispatchEvent("click");
+      await flushBrowserFrames(page);
+      expect(saveResponses).toBe(1);
+
+      gate.release();
+      await expect(page.getByTestId("workflows-action-success")).toContainText(`Saved ${name}`);
+      await expect(page.getByTestId(`workflow-spec-${name}`)).toBeVisible();
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
   test("runs persistent goal, reviewed correction, and ordered bounded fan-out", async ({
     page,
   }, testInfo) => {
@@ -742,6 +787,20 @@ function isWorkflowRunListResponse(message: string | Buffer): boolean {
       message?: { type?: unknown };
     };
     return envelope.type === "session" && envelope.message?.type === "workflow.run.list.response";
+  } catch {
+    return false;
+  }
+}
+
+function isWorkflowSpecSaveResponse(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return envelope.type === "session" && envelope.message?.type === "workflow.spec.save.response";
   } catch {
     return false;
   }

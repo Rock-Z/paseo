@@ -4,8 +4,10 @@ import { Button } from "@/components/ui/button";
 
 export function WorkflowJsonImport({
   onLoad,
+  disabled = false,
 }: {
   onLoad: (content: string) => void;
+  disabled?: boolean;
 }): ReactElement {
   const inputRef = useRef<HTMLInputElement>(null);
   const handleChange = useCallback(
@@ -24,6 +26,7 @@ export function WorkflowJsonImport({
         size="sm"
         leftIcon={Upload}
         onPress={handlePress}
+        disabled={disabled}
         testID="workflow-import-file"
       >
         Import file
@@ -33,6 +36,7 @@ export function WorkflowJsonImport({
         type="file"
         accept="application/json,.json"
         onChange={handleChange}
+        disabled={disabled}
         style={hiddenInputStyle}
       />
     </>

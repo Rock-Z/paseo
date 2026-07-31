@@ -192,7 +192,7 @@ describe("workflow spec validation and materialization", () => {
         call: { flow: "child", with: { branch: "{{ branch }}" } },
         join: "all",
       },
-      on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+      on: { joined: "finish" },
     };
 
     const result = materializeWorkflowSpec(
@@ -639,7 +639,7 @@ describe("workflow spec validation and materialization", () => {
     const states = main.states as Record<string, Record<string, unknown>>;
     states.work = {
       call: { flow: "child", with: { objective: "{{ inputs.objective }}" } },
-      on: { returned: "fanout", "error.agent": "failed", "error.protocol": "failed" },
+      on: { returned: "fanout" },
     };
     states.fanout = {
       map: {
@@ -650,10 +650,74 @@ describe("workflow spec validation and materialization", () => {
         join: "all",
         concurrency: 2,
       },
-      on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+      on: { joined: "finish" },
     };
     expect(validateWorkflowTemplate(spec)).toMatchObject({ valid: true, issues: [] });
   });
+
+  it.each([
+    {
+      action: "call",
+      event: "error.agent",
+      definition: { call: { flow: "child", with: {} } },
+      continuation: { returned: "finish" },
+    },
+    {
+      action: "call",
+      event: "error.protocol",
+      definition: { call: { flow: "child", with: {} } },
+      continuation: { returned: "finish" },
+    },
+    {
+      action: "map",
+      event: "error.agent",
+      definition: {
+        map: {
+          group: "items",
+          items: "{{ inputs.items }}",
+          as: "item",
+          call: { flow: "child", with: { item: "{{ item }}" } },
+          join: "all",
+        },
+      },
+      continuation: { joined: "finish" },
+    },
+    {
+      action: "map",
+      event: "error.protocol",
+      definition: {
+        map: {
+          group: "items",
+          items: "{{ inputs.items }}",
+          as: "item",
+          call: { flow: "child", with: { item: "{{ item }}" } },
+          join: "all",
+        },
+      },
+      continuation: { joined: "finish" },
+    },
+  ])(
+    "rejects unreachable $event routes on $action states",
+    ({ definition, continuation, event }) => {
+      const spec = baseSpec();
+      const flows = spec.flows as Record<string, Record<string, unknown>>;
+      flows.child = {
+        initial: "finish",
+        inputs: {},
+        states: { finish: { return: { output: "{{ inputs }}" } } },
+      };
+      const states = flows.main.states as Record<string, Record<string, unknown>>;
+      states.work = {
+        ...definition,
+        on: { ...continuation, [event]: "failed" },
+      };
+
+      expect(validateWorkflowTemplate(spec).issues).toContainEqual({
+        path: `flows.main.states.work.on.${event}`,
+        message: "unsupported event",
+      });
+    },
+  );
 
   it.each(["__proto__", "constructor", "prototype"])(
     "rejects prototype-sensitive map group %j",
@@ -674,7 +738,7 @@ describe("workflow spec validation and materialization", () => {
           call: { flow: "child", with: { item: "{{ item }}" } },
           join: "all",
         },
-        on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+        on: { joined: "finish" },
       };
 
       const result = validateWorkflowTemplate(spec);
@@ -711,7 +775,7 @@ describe("workflow spec validation and materialization", () => {
         join: "all",
         concurrency: count,
       },
-      on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+      on: { joined: "finish" },
     };
 
     const result = validateWorkflowTemplate(spec);
@@ -769,7 +833,7 @@ describe("workflow spec validation and materialization", () => {
           call: { flow: "child", with: { branch: "{{ branch }}" } },
           join: "all",
         },
-        on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+        on: { joined: "finish" },
       };
 
       const result = validateWorkflowTemplate(spec);

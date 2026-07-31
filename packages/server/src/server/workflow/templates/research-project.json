@@ -194,9 +194,7 @@
             "concurrency": "{{ parameters.concurrency }}"
           },
           "on": {
-            "joined": "integrate",
-            "error.agent": "failed",
-            "error.protocol": "failed"
+            "joined": "integrate"
           }
         },
         "integrate": {

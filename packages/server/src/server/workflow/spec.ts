@@ -793,13 +793,13 @@ function validateState(
     if (!routes.has("returned")) {
       issues.add(`${path}.on.returned`, "required");
     }
-    validateAllowedRoutes(routes, new Set([...RUNTIME_EVENTS, "returned"]), path, issues);
+    validateAllowedRoutes(routes, new Set(["returned"]), path, issues);
   } else if (action === "map") {
     validateMap(value.map, `${path}.map`, flowNames, parameters, allowMaterializedMapItems, issues);
     if (!routes.has("joined")) {
       issues.add(`${path}.on.joined`, "required");
     }
-    validateAllowedRoutes(routes, new Set([...RUNTIME_EVENTS, "joined"]), path, issues);
+    validateAllowedRoutes(routes, new Set(["joined"]), path, issues);
   } else if (action === "return") {
     validateReturnState(value, path, issues);
   } else {
