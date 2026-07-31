@@ -166,6 +166,69 @@ describe("PaseoWorkflowRuntimeAdapter", () => {
     expect(subscribe).not.toHaveBeenCalled();
   });
 
+  it("recovers assistant text only from the receipted native turn", async () => {
+    const agent = {
+      id: "agent-shared",
+      activeForegroundTurnId: null,
+      lifecycle: "idle",
+      recentTurnReceipts: [
+        {
+          turnId: "native-workflow",
+          clientMessageId: "client-workflow",
+          status: "failed",
+          error: "workflow provider failed",
+        },
+      ],
+    };
+    const adapter = new PaseoWorkflowRuntimeAdapter({
+      agentManager: {
+        getAgent: vi.fn(() => agent),
+        getActiveForegroundClientMessageId: vi.fn(() => null),
+        getTimelineRows: vi.fn(async () => [
+          {
+            item: {
+              type: "user_message",
+              clientMessageId: "client-workflow",
+            },
+          },
+          { item: { type: "assistant_message", text: "workflow response" } },
+          {
+            item: {
+              type: "user_message",
+              clientMessageId: "client-unrelated",
+            },
+          },
+          { item: { type: "assistant_message", text: "unrelated later response" } },
+        ]),
+        subscribe: vi.fn(() => () => undefined),
+        hasInFlightRun: vi.fn(() => false),
+      } as never,
+      agentStorage: {} as never,
+      providerSnapshotManager: {} as never,
+      workspaceRegistry: {} as never,
+      createAgent: (() => undefined) as never,
+      createPaseoWorktree: (() => undefined) as never,
+      logger: {} as never,
+    });
+
+    await expect(
+      adapter.reconcileTurn({
+        agentId: agent.id,
+        nativeTurnId: "native-workflow",
+        clientMessageId: "client-workflow",
+      }),
+    ).resolves.toEqual({
+      state: "completed",
+      result: {
+        agentId: agent.id,
+        nativeTurnId: "native-workflow",
+        status: "failed",
+        lastMessage: "workflow response",
+        lastError: "workflow provider failed",
+      },
+    });
+  });
+
   it("does not adopt an unrelated foreground turn without matching client identity", async () => {
     const agent = {
       id: "agent-shared",

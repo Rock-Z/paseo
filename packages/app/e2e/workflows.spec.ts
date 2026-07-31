@@ -183,17 +183,23 @@ test.describe("Native workflows", () => {
   test("keeps the latest run list when an older poll arrives late", async ({ page }) => {
     const workspace = await seedWorkspace({ repoPrefix: "workflow-list-order-" });
     const name = uniqueWorkflowName("list-order");
+    let inspectResponses = 0;
     let gate: WorkflowResponseGate | null = null;
     try {
       await enablePaseoTools(workspace.client);
-      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 15_000 }));
+      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 45_000 }));
       const runId = await startWorkflow(workspace.client, {
         workflowId: name,
         workspaceId: workspace.workspaceId,
       });
       await waitForActiveTurn(workspace.client, runId);
 
-      gate = await delayWorkflowResponse(page, isWorkflowRunListResponse, { skip: 1 });
+      gate = await delayWorkflowResponse(page, isWorkflowRunListResponse, {
+        skip: 1,
+        onServerMessage: (message) => {
+          if (workflowInspectResponseRunId(message) === runId) inspectResponses += 1;
+        },
+      });
       await page.goto(
         buildWorkflowsRoute({
           serverId: getServerId(),
@@ -204,11 +210,21 @@ test.describe("Native workflows", () => {
       await expect(runCard.getByText("running", { exact: true })).toBeVisible({
         timeout: 30_000,
       });
+      await runCard.click();
+      await expect(
+        page.getByTestId("workflow-run-details").getByText("running", { exact: true }),
+      ).toBeVisible();
+      await expect.poll(() => inspectResponses).toBe(1);
       await gate.waitForDelayedResponse();
+      expect(inspectResponses).toBe(1);
       await waitForWorkflow(workspace.client, runId, ["complete"]);
       await expect(runCard.getByText("complete", { exact: true })).toBeVisible({
         timeout: 10_000,
       });
+      await expect(
+        page.getByTestId("workflow-run-details").getByText("complete", { exact: true }),
+      ).toBeVisible();
+      await expect.poll(() => inspectResponses).toBe(2);
 
       gate.release();
       await flushBrowserFrames(page);
@@ -670,7 +686,10 @@ interface WorkflowResponseGate {
 async function delayWorkflowResponse(
   page: Page,
   shouldDelay: (message: string | Buffer) => boolean,
-  options: { skip?: number } = {},
+  options: {
+    skip?: number;
+    onServerMessage?: (message: string | Buffer) => void;
+  } = {},
 ): Promise<WorkflowResponseGate> {
   let releaseRequested = false;
   let delayedResponseSeen = false;
@@ -685,6 +704,7 @@ async function delayWorkflowResponse(
     const server = ws.connectToServer();
     ws.onMessage((message) => server.send(message));
     server.onMessage((message) => {
+      options.onServerMessage?.(message);
       if (!delayedResponseSeen && shouldDelay(message)) {
         if (skippedResponses < (options.skip ?? 0)) {
           skippedResponses += 1;

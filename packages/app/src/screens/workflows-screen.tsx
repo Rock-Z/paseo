@@ -215,10 +215,21 @@ function WorkflowHostScreen({
     if (!runs.some((run) => ACTIVE_STATUSES.has(run.status))) return;
     const timer = setInterval(() => {
       void load(true);
-      if (details?.run.id) void refreshDetails(details.run.id);
     }, 1_500);
     return () => clearInterval(timer);
-  }, [details?.run.id, load, refreshDetails, runs]);
+  }, [load, runs]);
+
+  useEffect(() => {
+    if (!details) return;
+    const summary = runs.find((run) => run.id === details.run.id);
+    if (!summary || summary.updatedAt <= details.run.updatedAt) return;
+    const becameTerminal =
+      ACTIVE_STATUSES.has(details.run.status) && !ACTIVE_STATUSES.has(summary.status);
+    setDetails((current) =>
+      current?.run.id === summary.id ? { ...current, run: summary } : current,
+    );
+    if (becameTerminal) void refreshDetails(summary.id);
+  }, [details, refreshDetails, runs]);
 
   const chooseSpec = useCallback(
     async (spec: WorkflowSpecSummary) => {
@@ -357,8 +368,12 @@ function WorkflowHostScreen({
     setEditorOpen((value) => !value);
   }, []);
   const handleRefresh = useCallback(() => {
-    void load();
-  }, [load]);
+    void (async () => {
+      await load();
+      const runId = selectedRunIdRef.current;
+      if (runId) await refreshDetails(runId);
+    })();
+  }, [load, refreshDetails]);
   const handleLaunchFormChange = useCallback((name: string, value: string | null) => {
     setLaunchForm((current) => updateWorkflowLaunchValue(current, name, value));
   }, []);

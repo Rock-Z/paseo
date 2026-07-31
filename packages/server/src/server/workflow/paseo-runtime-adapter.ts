@@ -512,10 +512,13 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
       (row) => row.item.type === "user_message" && row.item.clientMessageId === clientMessageId,
     );
     if (start < 0 && !receipt) return null;
+    const nextTurnOffset =
+      start < 0 ? -1 : rows.slice(start + 1).findIndex((row) => row.item.type === "user_message");
+    const turnEnd = nextTurnOffset < 0 ? rows.length : start + 1 + nextTurnOffset;
     const assistant =
       start < 0
         ? undefined
-        : rows.slice(start + 1).findLast((row) => row.item.type === "assistant_message");
+        : rows.slice(start + 1, turnEnd).findLast((row) => row.item.type === "assistant_message");
     const lastMessage = assistant?.item.type === "assistant_message" ? assistant.item.text : "";
     if (receipt) {
       return {

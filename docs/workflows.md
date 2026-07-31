@@ -135,5 +135,7 @@ the entire feature on `server_info.features.workflows`; do not add per-operation
 The Workflows screen is available in browser web and Electron desktop. It shows specs, declared
 parameters, validation results, run state, events, rendered prompts, errors, and links to native
 agent and workspace screens. Transcripts, permissions, agent controls, and workspace controls stay
-on their existing Paseo surfaces. Mobile has no Workflows route in this release; backend and
-protocol behavior remain platform-neutral.
+on their existing Paseo surfaces. Automatic monitoring polls run summaries. Full audit details load
+on selection, explicit refresh, mutations, and the transition to a terminal state so polling cost
+does not grow with run history. Mobile has no Workflows route in this release; backend and protocol
+behavior remain platform-neutral.
