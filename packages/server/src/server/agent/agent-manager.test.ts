@@ -8233,6 +8233,118 @@ test("a canceled identified turn is durable before runAgent resolves and survive
   }
 });
 
+test("a terminal receipt write failure settles the native turn as a durable failure", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-receipt-failure-"));
+  const storagePath = join(workdir, "agents");
+
+  class FailFirstTerminalReceiptStorage extends AgentStorage {
+    private failed = false;
+
+    override async applySnapshot(
+      agent: ManagedAgent,
+      options?: { title?: string | null; internal?: boolean },
+    ): Promise<void> {
+      const receipts = (
+        agent as ManagedAgent & {
+          recentTurnReceipts?: Array<{ clientMessageId: string; status: string }>;
+        }
+      ).recentTurnReceipts;
+      if (
+        !this.failed &&
+        receipts?.some(
+          (receipt) =>
+            receipt.clientMessageId === "workflow-client-message" && receipt.status === "completed",
+        )
+      ) {
+        this.failed = true;
+        throw new Error("injected terminal receipt write failure");
+      }
+      await super.applySnapshot(agent, options);
+    }
+  }
+
+  class CompletedTurnSession extends TestAgentSession {
+    override async startTurn(
+      prompt: AgentPromptInput,
+      options?: AgentRunOptions,
+    ): Promise<{ turnId: string }> {
+      const turnId = "turn-completed-with-receipt-failure";
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: {
+            type: "user_message",
+            text: typeof prompt === "string" ? prompt : "",
+            clientMessageId: options?.clientMessageId,
+          },
+        });
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      }, 0);
+      return { turnId };
+    }
+  }
+
+  class CompletedTurnClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new CompletedTurnSession(config);
+    }
+  }
+
+  const storage = new FailFirstTerminalReceiptStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: { codex: new CompletedTurnClient() },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000404",
+  });
+
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const result = manager.runAgent(snapshot.id, "complete this workflow turn", {
+      clientMessageId: "workflow-client-message",
+    });
+    const outcome = await Promise.race([
+      result.then(
+        () => ({ kind: "resolved" as const }),
+        (error: unknown) => ({
+          kind: "rejected" as const,
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      ),
+      new Promise<{ kind: "timeout" }>((resolve) =>
+        setTimeout(() => resolve({ kind: "timeout" }), 1_000),
+      ),
+    ]);
+
+    expect(outcome).toMatchObject({
+      kind: "rejected",
+      message: expect.stringContaining("injected terminal receipt write failure"),
+    });
+    expect(manager.getAgent(snapshot.id)).toMatchObject({
+      lifecycle: "error",
+      activeForegroundTurnId: null,
+    });
+    const stored = (await storage.get(snapshot.id)) as StoredAgentRecord & {
+      recentTurnReceipts?: Array<Record<string, unknown>>;
+    };
+    expect(stored.recentTurnReceipts).toContainEqual({
+      turnId: "turn-completed-with-receipt-failure",
+      clientMessageId: "workflow-client-message",
+      status: "failed",
+      error: expect.stringContaining("injected terminal receipt write failure"),
+    });
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("replaceAgentRun succeeds when foreground turn terminal event is never delivered", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stale-fg-"));
   const storagePath = join(workdir, "agents");

@@ -239,6 +239,22 @@ describe("workflow spec validation and materialization", () => {
     );
   });
 
+  it.each(["mode", "modeId", "thinking", "thinkingOptionId"])(
+    "rejects an empty %s agent setting",
+    (field) => {
+      const spec = baseSpec();
+      const agents = spec.agents as Record<string, Record<string, Record<string, unknown>>>;
+      agents.worker.createAgent.settings = { [field]: "" };
+
+      const result = validateWorkflowTemplate(spec);
+      expect(result.valid).toBe(false);
+      expect(result.issues).toContainEqual({
+        path: `agents.worker.createAgent.settings.${field}`,
+        message: "must be a non-empty string",
+      });
+    },
+  );
+
   it.each([
     ["newBranch", null],
     ["newBranch", 1],

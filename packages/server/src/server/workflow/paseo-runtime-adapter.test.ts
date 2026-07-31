@@ -124,6 +124,53 @@ describe("PaseoWorkflowRuntimeAdapter", () => {
     expect(getProvider).toHaveBeenCalledOnce();
   });
 
+  it("validates a bound role fallback when a child flow uses that role", async () => {
+    const getProvider = vi.fn(async () => {
+      throw new Error("child fallback provider is unavailable");
+    });
+    const adapter = new PaseoWorkflowRuntimeAdapter({
+      agentManager: {} as never,
+      agentStorage: {} as never,
+      providerSnapshotManager: {
+        getProvider,
+        resolveCreateConfig: vi.fn(async () => ({})),
+      } as never,
+      workspaceRegistry: {} as never,
+      createAgent: (() => undefined) as never,
+      createPaseoWorktree: (() => undefined) as never,
+      logger: {} as never,
+    });
+    const spec: JsonObject = {
+      bindings: {
+        worktree: process.cwd(),
+        agents: { worker: "agent-existing" },
+      },
+      workspace: { createWorktree: { cwd: process.cwd() } },
+      agents: {
+        worker: {
+          createAgent: { provider: "unavailable-child-fallback" },
+        },
+      },
+      flows: {
+        main: {
+          states: {
+            launch: { call: { flow: "child" } },
+          },
+        },
+        child: {
+          states: {
+            work: { turn: { agent: "worker" } },
+          },
+        },
+      },
+    };
+
+    await expect(adapter.validateMaterializedSpec(spec, {})).rejects.toThrow(
+      "child fallback provider is unavailable",
+    );
+    expect(getProvider).toHaveBeenCalledOnce();
+  });
+
   it.each(["codex/", "/gpt-5.4"])(
     "rejects a provider/model value with an empty segment: %s",
     async (provider) => {

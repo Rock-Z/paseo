@@ -3042,14 +3042,14 @@ export class AgentManager {
       "agent.manager.dispatch_session_event",
     );
 
-    const shouldNotifyWaiters = await this.handleStreamEvent(agent, event);
+    const handled = await this.handleStreamEvent(agent, event);
 
-    if (!shouldNotifyWaiters) {
+    if (!handled.shouldNotifyWaiters) {
       return;
     }
 
-    this.runs.notifyWaiters(matchingWaiters, event, {
-      terminal: isTurnTerminalEvent(event),
+    this.runs.notifyWaiters(matchingWaiters, handled.event, {
+      terminal: isTurnTerminalEvent(handled.event),
     });
     this.logger.trace(
       {
@@ -3058,8 +3058,8 @@ export class AgentManager {
         sessionId: agent.persistence?.sessionId ?? undefined,
         turnId,
         notifiedWaiterCount: matchingWaiters.length,
-        terminal: isTurnTerminalEvent(event),
-        event,
+        terminal: isTurnTerminalEvent(handled.event),
+        event: handled.event,
       },
       "agent.manager.notify_waiters",
     );
@@ -3321,7 +3321,7 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     event: AgentStreamEvent,
     options?: HandleStreamEventOptions,
-  ): Promise<boolean> {
+  ): Promise<{ event: AgentStreamEvent; shouldNotifyWaiters: boolean }> {
     if (event.type === "timeline") {
       event = {
         ...event,
@@ -3336,7 +3336,7 @@ export class AgentManager {
       isTurnTerminalEvent(event) &&
       this.runs.hasFinalizedTurn(agent, eventTurnId)
     ) {
-      return false;
+      return { event, shouldNotifyWaiters: false };
     }
 
     // Only update timestamp for live events, not history replay
@@ -3344,14 +3344,14 @@ export class AgentManager {
       this.touchUpdatedAt(agent);
       if (this.agentStreamCoalescer.handle(agent.id, event)) {
         this.traceCoalescerBuffered(agent, event, eventTurnId);
-        return false;
+        return { event, shouldNotifyWaiters: false };
       }
       this.agentStreamCoalescer.flushFor(agent.id);
     }
 
     const flags: StreamEventFlags = { shouldDispatchEvent: true, shouldNotifyWaiters: true };
 
-    await this.persistIdentifiedTurnReceipt({
+    event = await this.ensureIdentifiedTerminalEventDurable({
       agent,
       event,
       eventTurnId,
@@ -3384,7 +3384,44 @@ export class AgentManager {
 
     this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
 
-    return flags.shouldNotifyWaiters;
+    return { event, shouldNotifyWaiters: flags.shouldNotifyWaiters };
+  }
+
+  private async ensureIdentifiedTerminalEventDurable(input: {
+    agent: ActiveManagedAgent;
+    event: AgentStreamEvent;
+    eventTurnId: string | undefined;
+    isForegroundEvent: boolean;
+    fromHistory: boolean;
+  }): Promise<AgentStreamEvent> {
+    try {
+      await this.persistIdentifiedTurnReceipt(input);
+      return input.event;
+    } catch (error) {
+      const message = `Failed to persist terminal turn receipt: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+      this.logger.error(
+        { err: error, agentId: input.agent.id, turnId: input.eventTurnId },
+        "Failed to persist identified terminal turn receipt",
+      );
+      const failureEvent: AgentStreamEvent = {
+        type: "turn_failed",
+        provider: input.event.provider,
+        turnId: input.eventTurnId,
+        error: message,
+        code: "turn_receipt_persistence_failed",
+      };
+      try {
+        await this.persistIdentifiedTurnReceipt({ ...input, event: failureEvent });
+      } catch (failureReceiptError) {
+        this.logger.error(
+          { err: failureReceiptError, agentId: input.agent.id, turnId: input.eventTurnId },
+          "Failed to persist terminal turn failure receipt",
+        );
+      }
+      return failureEvent;
+    }
   }
 
   private async persistIdentifiedTurnReceipt(input: {

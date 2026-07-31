@@ -31,6 +31,12 @@ test.describe("Native workflows", () => {
     const workspace = await seedWorkspace({ repoPrefix: "workflow-ui-" });
     const name = uniqueWorkflowName("ui");
     const spec = buildTwoTurnWorkflow({ name, delayMs: 1_500 });
+    const parameters = spec.parameters as Record<string, unknown>;
+    parameters.optionalNote = {
+      type: "string",
+      description: "Optional launch note",
+      default: null,
+    };
     try {
       await enablePaseoTools(workspace.client);
       await page.goto(buildWorkflowsRoute({ serverId: "removed-workflow-host" }));
@@ -75,6 +81,13 @@ test.describe("Native workflows", () => {
       await expect(page.getByTestId("workflow-param-workspaceRef")).toContainText(
         "current.workspace",
       );
+      const optionalNote = page.getByTestId("workflow-param-optionalNote").getByRole("textbox");
+      await expect(optionalNote).toBeDisabled();
+      await expect(page.getByTestId("workflow-param-optionalNote-null")).toContainText(
+        "Enter value",
+      );
+      await page.getByTestId("workflow-param-optionalNote-null").click();
+      await optionalNote.fill("custom note");
       await page.getByTestId("workflow-launch-submit").click();
       await expect(page.getByTestId("workflows-action-success")).toContainText("Queued wfr_");
 
@@ -226,7 +239,7 @@ test.describe("Native workflows", () => {
           workerProvider: "mock",
           workerModel: "ten-second-stream",
           workerMode: "load-test",
-          workerThinking: "",
+          workerThinking: "low",
           objective: goalDemoObjective(),
           maxIterations: 4,
           maxRuntime: "5m",
@@ -246,11 +259,11 @@ test.describe("Native workflows", () => {
           workerProvider: "mock",
           workerModel: "ten-second-stream",
           workerMode: "load-test",
-          workerThinking: "",
+          workerThinking: "low",
           reviewerProvider: "mock",
           reviewerModel: "ten-second-stream",
           reviewerMode: "load-test",
-          reviewerThinking: "",
+          reviewerThinking: "low",
           objective: reviewedGoalDemoObjective(),
           reviewerDirective: "Require one explicit correction before accepting the final result.",
           maxRuntime: "5m",

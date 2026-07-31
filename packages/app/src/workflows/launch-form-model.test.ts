@@ -133,6 +133,12 @@ describe("workflow launch form model", () => {
       ok: true,
       parameters: { text: null, items: null, options: null },
     });
+
+    const overridden = updateWorkflowLaunchValue(form, "text", "custom value");
+    expect(submitWorkflowLaunchForm(overridden, nullDefaults)).toEqual({
+      ok: true,
+      parameters: { text: "custom value", items: null, options: null },
+    });
   });
 
   it("returns field errors without discarding entered values", () => {

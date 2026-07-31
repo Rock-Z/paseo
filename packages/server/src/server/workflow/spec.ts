@@ -441,8 +441,11 @@ function validateCreateAgent(create: JsonObject, path: string, issues: Issues): 
     new Set(["mode", "modeId", "thinking", "thinkingOptionId", "featureValues"]),
   );
   for (const field of ["mode", "modeId", "thinking", "thinkingOptionId"]) {
-    if (field in create.settings && typeof create.settings[field] !== "string") {
-      issues.add(`${path}.settings.${field}`, "must be a string");
+    if (
+      field in create.settings &&
+      (typeof create.settings[field] !== "string" || !create.settings[field].trim())
+    ) {
+      issues.add(`${path}.settings.${field}`, "must be a non-empty string");
     }
   }
   if ("featureValues" in create.settings && !isObject(create.settings.featureValues)) {

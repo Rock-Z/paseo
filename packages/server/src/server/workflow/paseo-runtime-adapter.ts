@@ -78,8 +78,9 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     const agents = objectValue(spec.agents, "agents");
     const bindings = isObject(spec.bindings) ? spec.bindings : {};
     const boundAgents = isObject(bindings.agents) ? bindings.agents : {};
+    const childRoles = childFlowAgentRoles(spec);
     for (const [role, rawDeclaration] of Object.entries(agents)) {
-      if (typeof boundAgents[role] === "string") continue;
+      if (typeof boundAgents[role] === "string" && !childRoles.has(role)) continue;
       const declaration = objectValue(rawDeclaration, `agents.${role}`);
       const create = objectValue(declaration.createAgent, `agents.${role}.createAgent`);
       await this.validateAgentCreate(create, cwd, `agents.${role}.createAgent`);
@@ -589,6 +590,35 @@ function validateThinkingOption(
   if (!model.thinkingOptions.some((option) => option.id === thinking)) {
     throw new Error(`${path}.settings.thinkingOptionId: ${thinking} is not available`);
   }
+}
+
+function childFlowAgentRoles(spec: JsonObject): Set<string> {
+  const flows = isObject(spec.flows) ? spec.flows : {};
+  const childFlows = new Set<string>();
+  for (const rawFlow of Object.values(flows)) {
+    if (!isObject(rawFlow) || !isObject(rawFlow.states)) continue;
+    for (const rawState of Object.values(rawFlow.states)) {
+      if (!isObject(rawState)) continue;
+      let call: JsonObject | null = null;
+      if (isObject(rawState.call)) {
+        call = rawState.call;
+      } else if (isObject(rawState.map) && isObject(rawState.map.call)) {
+        call = rawState.map.call;
+      }
+      if (call && typeof call.flow === "string") childFlows.add(call.flow);
+    }
+  }
+
+  const roles = new Set<string>();
+  for (const flowName of childFlows) {
+    const flow = flows[flowName];
+    if (!isObject(flow) || !isObject(flow.states)) continue;
+    for (const rawState of Object.values(flow.states)) {
+      if (!isObject(rawState) || !isObject(rawState.turn)) continue;
+      if (typeof rawState.turn.agent === "string") roles.add(rawState.turn.agent);
+    }
+  }
+  return roles;
 }
 
 function objectValue(value: unknown, path: string): JsonObject {

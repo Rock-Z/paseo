@@ -648,6 +648,12 @@ function WorkflowParameterField({
   const hint = parameter.defaultFrom
     ? `${parameter.description} Uses ${parameter.defaultFrom} when left blank.`
     : parameter.description;
+  const canToggleNull =
+    !parameter.required && (parameter.defaultFrom !== undefined || parameter.defaultValue === null);
+  let nullToggleLabel = "Set null";
+  if (value === null) {
+    nullToggleLabel = parameter.defaultFrom ? "Use current default" : "Enter value";
+  }
   return (
     <Field
       label={parameter.name}
@@ -663,7 +669,7 @@ function WorkflowParameterField({
           placeholder={parameterPlaceholder(parameter, context)}
           editable={!pending && value !== null}
         />
-        {parameter.defaultFrom && !parameter.required ? (
+        {canToggleNull ? (
           <Button
             variant="outline"
             size="xs"
@@ -671,7 +677,7 @@ function WorkflowParameterField({
             disabled={pending}
             testID={`workflow-param-${parameter.name}-null`}
           >
-            {value === null ? "Use current default" : "Set null"}
+            {nullToggleLabel}
           </Button>
         ) : null}
       </View>
