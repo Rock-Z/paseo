@@ -94,6 +94,7 @@ export function toStoredAgentRecord(
       : null,
     internal: options?.internal,
     owner: agent.owner,
+    recentTurnReceipts: structuredClone(agent.recentTurnReceipts ?? []),
   } satisfies StoredAgentRecord;
 }
 

@@ -202,6 +202,13 @@ export interface AgentRunOptions {
   clientMessageId?: string;
 }
 
+export interface AgentTurnReceipt {
+  turnId: string;
+  clientMessageId: string;
+  status: "completed" | "failed" | "canceled";
+  error: string | null;
+}
+
 export interface AgentUsage {
   inputTokens?: number;
   cachedInputTokens?: number;

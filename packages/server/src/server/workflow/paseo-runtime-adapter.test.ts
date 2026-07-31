@@ -3,6 +3,54 @@ import { PaseoWorkflowRuntimeAdapter } from "./paseo-runtime-adapter.js";
 import type { JsonObject } from "./spec.js";
 
 describe("PaseoWorkflowRuntimeAdapter", () => {
+  it("recovers a canceled native turn from its durable terminal receipt", async () => {
+    const agent = {
+      id: "agent-workflow",
+      activeForegroundTurnId: null,
+      lifecycle: "idle",
+      recentTurnReceipts: [
+        {
+          turnId: "native-workflow",
+          clientMessageId: "client-workflow",
+          status: "canceled",
+          error: null,
+        },
+      ],
+    };
+    const adapter = new PaseoWorkflowRuntimeAdapter({
+      agentManager: {
+        getAgent: vi.fn(() => agent),
+        getActiveForegroundClientMessageId: vi.fn(() => null),
+        getTimelineRows: vi.fn(async () => []),
+        subscribe: vi.fn(() => () => undefined),
+        hasInFlightRun: vi.fn(() => false),
+      } as never,
+      agentStorage: {} as never,
+      providerSnapshotManager: {} as never,
+      workspaceRegistry: {} as never,
+      createAgent: (() => undefined) as never,
+      createPaseoWorktree: (() => undefined) as never,
+      logger: {} as never,
+    });
+
+    await expect(
+      adapter.reconcileTurn({
+        agentId: agent.id,
+        nativeTurnId: "native-workflow",
+        clientMessageId: "client-workflow",
+      }),
+    ).resolves.toEqual({
+      state: "completed",
+      result: {
+        agentId: agent.id,
+        nativeTurnId: "native-workflow",
+        status: "canceled",
+        lastMessage: "",
+        lastError: null,
+      },
+    });
+  });
+
   it("does not adopt an unrelated foreground turn without matching client identity", async () => {
     const agent = {
       id: "agent-shared",
@@ -75,6 +123,39 @@ describe("PaseoWorkflowRuntimeAdapter", () => {
     );
     expect(getProvider).toHaveBeenCalledOnce();
   });
+
+  it.each(["codex/", "/gpt-5.4"])(
+    "rejects a provider/model value with an empty segment: %s",
+    async (provider) => {
+      const getProvider = vi.fn(async () => ({ status: "ready", models: [] }));
+      const adapter = new PaseoWorkflowRuntimeAdapter({
+        agentManager: {} as never,
+        agentStorage: {} as never,
+        providerSnapshotManager: {
+          getProvider,
+          resolveCreateConfig: vi.fn(async () => ({})),
+        } as never,
+        workspaceRegistry: {} as never,
+        createAgent: (() => undefined) as never,
+        createPaseoWorktree: (() => undefined) as never,
+        logger: {} as never,
+      });
+      const spec: JsonObject = {
+        bindings: { worktree: process.cwd(), agents: {} },
+        workspace: { createWorktree: { cwd: process.cwd() } },
+        agents: {
+          worker: {
+            createAgent: { provider },
+          },
+        },
+      };
+
+      await expect(adapter.validateMaterializedSpec(spec, {})).rejects.toThrow(
+        "provider and model must both be non-empty",
+      );
+      expect(getProvider).not.toHaveBeenCalled();
+    },
+  );
 
   it("normalizes validated mode and thinking aliases before creating an agent", async () => {
     const createAgent = vi.fn(async () => ({ snapshot: { id: "agent-created" } }));

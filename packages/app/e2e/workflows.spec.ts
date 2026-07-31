@@ -95,6 +95,19 @@ test.describe("Native workflows", () => {
       await expect(page.getByText("Rendered prompts (2)", { exact: true })).toBeVisible();
       await captureEvidence(page, testInfo, "workflows-browser-complete");
 
+      const workspaceId = complete.run.workspaceIds[0];
+      expect(workspaceId).toBeTruthy();
+      await page.getByRole("button", { name: workspaceId }).click();
+      await expect(page).toHaveURL(/\/workspace\//);
+      await expect(page).not.toHaveURL(/\/workflows/);
+
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await page.getByTestId(`workflow-run-${runId}`).click();
       const agentId = complete.run.agentIds[0];
       expect(agentId).toBeTruthy();
       await page.getByRole("button", { name: agentId }).click();

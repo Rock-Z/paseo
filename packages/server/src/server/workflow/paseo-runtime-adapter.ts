@@ -298,7 +298,7 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
   }
 
   private async validateAgentCreate(create: JsonObject, cwd: string, path: string): Promise<void> {
-    const { provider, model } = providerAndModel(create);
+    const { provider, model } = providerAndModel(create, path);
     const entry = await this.providerSnapshotManager.getProvider({
       provider,
       cwd,
@@ -475,16 +475,34 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     nativeTurnId: string | null,
     clientMessageId: string,
   ): Promise<WorkflowTurnResult | null> {
+    const agent = this.agentManager.getAgent(agentId);
+    const receipt = agent?.recentTurnReceipts?.findLast(
+      (candidate) =>
+        candidate.clientMessageId === clientMessageId &&
+        (!nativeTurnId || candidate.turnId === nativeTurnId),
+    );
     const rows = await this.agentManager.getTimelineRows(agentId);
     const start = rows.findLastIndex(
       (row) => row.item.type === "user_message" && row.item.clientMessageId === clientMessageId,
     );
-    if (start < 0) return null;
-    const assistant = rows
-      .slice(start + 1)
-      .findLast((row) => row.item.type === "assistant_message");
+    if (start < 0 && !receipt) return null;
+    const assistant =
+      start < 0
+        ? undefined
+        : rows.slice(start + 1).findLast((row) => row.item.type === "assistant_message");
     const lastMessage = assistant?.item.type === "assistant_message" ? assistant.item.text : "";
-    const agent = this.agentManager.getAgent(agentId);
+    if (receipt) {
+      return {
+        agentId,
+        nativeTurnId: receipt.turnId,
+        status: receipt.status,
+        lastMessage,
+        lastError: receipt.error,
+      };
+    }
+    // COMPAT(workflowTurnReceipt): added in v0.2.5, remove after 2027-01-31.
+    // Agent snapshots written before native turn receipts can only recover the
+    // historical completion heuristic used by installed v0.2 workflows.
     return {
       agentId,
       nativeTurnId,
@@ -544,10 +562,16 @@ function providerModelValue(create: JsonObject): string {
   return model ? `${provider}/${model}` : provider;
 }
 
-function providerAndModel(create: JsonObject): { provider: string; model: string | undefined } {
-  const value = stringValue(create.provider, "createAgent.provider");
+function providerAndModel(
+  create: JsonObject,
+  path = "createAgent",
+): { provider: string; model: string | undefined } {
+  const value = stringValue(create.provider, `${path}.provider`);
   const slash = value.indexOf("/");
   if (slash >= 0) {
+    if (slash === 0 || slash === value.length - 1) {
+      throw new Error(`${path}.provider: provider and model must both be non-empty around "/"`);
+    }
     return { provider: value.slice(0, slash), model: value.slice(slash + 1) };
   }
   return {

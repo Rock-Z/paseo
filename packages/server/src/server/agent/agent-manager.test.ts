@@ -8098,6 +8098,141 @@ test("authoritative timeline includes provider-emitted submitted user prompt", a
   }
 });
 
+test("a canceled identified turn is durable before runAgent resolves and survives reload", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-receipt-"));
+  const storagePath = join(workdir, "agents");
+  const receiptPersistStarted = deferred<void>();
+  const allowReceiptPersist = deferred<void>();
+
+  class BlockingReceiptStorage extends AgentStorage {
+    override async applySnapshot(
+      agent: ManagedAgent,
+      options?: { title?: string | null; internal?: boolean },
+    ): Promise<void> {
+      const receipts = (
+        agent as ManagedAgent & {
+          recentTurnReceipts?: Array<{ clientMessageId: string; status: string }>;
+        }
+      ).recentTurnReceipts;
+      if (
+        receipts?.some(
+          (receipt) =>
+            receipt.clientMessageId === "workflow-client-message" && receipt.status === "canceled",
+        )
+      ) {
+        receiptPersistStarted.resolve();
+        await allowReceiptPersist.promise;
+      }
+      await super.applySnapshot(agent, options);
+    }
+  }
+
+  class CanceledTurnSession extends TestAgentSession {
+    override async startTurn(
+      prompt: AgentPromptInput,
+      options?: AgentRunOptions,
+    ): Promise<{ turnId: string }> {
+      const turnId = "turn-canceled-workflow";
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: {
+            type: "user_message",
+            text: typeof prompt === "string" ? prompt : "",
+            clientMessageId: options?.clientMessageId,
+          },
+        });
+        this.pushEvent({
+          type: "turn_canceled",
+          provider: this.provider,
+          turnId,
+          reason: "interrupted",
+        });
+      }, 0);
+      return { turnId };
+    }
+  }
+
+  class CanceledTurnClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new CanceledTurnSession(config);
+    }
+  }
+
+  const storage = new BlockingReceiptStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: { codex: new CanceledTurnClient() },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000403",
+  });
+
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    let resultSettled = false;
+    const result = manager
+      .runAgent(snapshot.id, "cancel this workflow turn", {
+        clientMessageId: "workflow-client-message",
+      })
+      .finally(() => {
+        resultSettled = true;
+      });
+
+    await Promise.race([
+      receiptPersistStarted.promise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("terminal receipt persistence did not start")), 1_000),
+      ),
+    ]);
+    expect(resultSettled).toBe(false);
+    allowReceiptPersist.resolve();
+    await expect(result).resolves.toMatchObject({ canceled: true });
+
+    const stored = (await storage.get(snapshot.id)) as StoredAgentRecord & {
+      recentTurnReceipts?: Array<Record<string, unknown>>;
+    };
+    expect(stored.recentTurnReceipts).toContainEqual({
+      turnId: "turn-canceled-workflow",
+      clientMessageId: "workflow-client-message",
+      status: "canceled",
+      error: null,
+    });
+
+    const reloadedManager = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: storage,
+      logger,
+    });
+    const reloaded = await ensureAgentLoaded(snapshot.id, {
+      agentManager: reloadedManager,
+      agentStorage: storage,
+      logger,
+    });
+    expect(
+      (
+        reloaded as ManagedAgent & {
+          recentTurnReceipts?: Array<Record<string, unknown>>;
+        }
+      ).recentTurnReceipts,
+    ).toContainEqual({
+      turnId: "turn-canceled-workflow",
+      clientMessageId: "workflow-client-message",
+      status: "canceled",
+      error: null,
+    });
+  } finally {
+    allowReceiptPersist.resolve();
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("replaceAgentRun succeeds when foreground turn terminal event is never delivered", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stale-fg-"));
   const storagePath = join(workdir, "agents");

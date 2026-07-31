@@ -1304,6 +1304,61 @@ describe("WorkflowService runtime", () => {
     expect(details.events.filter((event) => event.type === "event_accepted")).toHaveLength(1);
   });
 
+  it("preserves a canceled native outcome when restart wins the workflow result commit", async () => {
+    const firstProcess = await setup(baseSpec());
+    const run = await firstProcess.service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Recover cancellation" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await firstProcess.adapter.waitForStarts(1);
+    await waitForActiveTurnPhase(firstProcess.storage, run.id, "running");
+    const active = firstProcess.adapter.starts[0];
+    firstProcess.service.dispose();
+
+    const restartedAdapter = new (class extends FakeRuntimeAdapter {
+      override async reconcileTurn(): Promise<WorkflowTurnReconciliation> {
+        return {
+          state: "completed",
+          result: {
+            agentId: active.request.agentId,
+            nativeTurnId: active.nativeTurnId,
+            status: "canceled",
+            lastMessage: "",
+            lastError: null,
+          },
+        };
+      }
+    })();
+    const restartedService = new WorkflowService({
+      storage: firstProcess.storage,
+      adapter: restartedAdapter,
+    });
+    await restartedService.initialize();
+    await restartedService.start();
+
+    await expect(waitForRunTerminal(restartedService, run.id)).resolves.toMatchObject({
+      status: "complete",
+    });
+    expect(restartedAdapter.starts).toHaveLength(0);
+    const details = await restartedService.inspectRun(run.id);
+    expect(details.events.filter((event) => event.type === "turn_started")).toHaveLength(1);
+    const roles = Object.values(details.state.instances).flatMap((instance) =>
+      Object.values(instance.agents),
+    );
+    expect(roles.flatMap((role) => role.turns)).toEqual([
+      expect.objectContaining({
+        clientMessageId: active.request.clientMessageId,
+        nativeTurnId: active.nativeTurnId,
+        status: "canceled",
+        emission: expect.objectContaining({
+          event: "error.agent",
+          data: { status: "canceled" },
+        }),
+      }),
+    ]);
+  });
+
   it("reconciles a native submission that crashed before its turn ID was persisted", async () => {
     const firstProcess = await setup(baseSpec());
     firstProcess.adapter.pauseAfterNativeSubmission = true;

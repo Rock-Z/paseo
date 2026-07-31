@@ -20,7 +20,8 @@ import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { useHostFeature } from "@/runtime/host-features";
 import { useHostRuntimeClient, useHosts } from "@/runtime/host-runtime";
-import { buildHostAgentDetailRoute, buildHostWorkspaceRoute } from "@/utils/host-routes";
+import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
+import { buildHostAgentDetailRoute } from "@/utils/host-routes";
 import {
   openWorkflowLaunchForm,
   submitWorkflowLaunchForm,
@@ -794,11 +795,11 @@ function AuditLinkButton({
   kind: "workspace" | "agent";
 }): ReactElement {
   const handlePress = useCallback(() => {
-    router.push(
-      kind === "workspace"
-        ? buildHostWorkspaceRoute(serverId, id)
-        : buildHostAgentDetailRoute(serverId, id),
-    );
+    if (kind === "workspace") {
+      navigateToWorkspace({ serverId, workspaceId: id });
+      return;
+    }
+    router.push(buildHostAgentDetailRoute(serverId, id));
   }, [id, kind, serverId]);
   return (
     <Button variant="ghost" size="xs" onPress={handlePress}>

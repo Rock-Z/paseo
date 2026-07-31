@@ -37,6 +37,7 @@ import {
   type AgentSessionConfig,
   type AgentStreamEvent,
   type AgentTimelineItem,
+  type AgentTurnReceipt,
   type AgentUsage,
   type AgentRuntimeInfo,
   type ImportedTimelineEntry,
@@ -236,6 +237,7 @@ export interface CreateAgentOptions {
   // undefined is an explicit decision: the agent never appears in the sidebar.
   workspaceId: string | undefined;
   owner?: AgentOwner;
+  recentTurnReceipts?: AgentTurnReceipt[];
 }
 
 export interface AgentManagerOptions {
@@ -291,6 +293,10 @@ function resolveInitialAttention(input: AttentionState | undefined): AttentionSt
   };
 }
 
+function cloneTurnReceipts(receipts: AgentTurnReceipt[] | undefined): AgentTurnReceipt[] {
+  return structuredClone(receipts ?? []);
+}
+
 interface StreamEventFlags {
   shouldDispatchEvent: boolean;
   shouldNotifyWaiters: boolean;
@@ -334,6 +340,7 @@ interface ManagedAgentBase {
   attention: AttentionState;
   foregroundTurnWaiters: Set<ForegroundTurnWaiter>;
   finalizedForegroundTurnIds: Set<string>;
+  recentTurnReceipts: AgentTurnReceipt[];
   unsubscribeSession: (() => void) | null;
   /**
    * Internal agents are hidden from listings and don't trigger notifications.
@@ -443,7 +450,12 @@ function isAgentBusy(status: AgentLifecycleStatus): boolean {
   return BUSY_STATUSES.has(status);
 }
 
-function isTurnTerminalEvent(event: AgentStreamEvent): boolean {
+function isTurnTerminalEvent(
+  event: AgentStreamEvent,
+): event is Extract<
+  AgentStreamEvent,
+  { type: "turn_completed" | "turn_failed" | "turn_canceled" }
+> {
   return (
     event.type === "turn_completed" ||
     event.type === "turn_failed" ||
@@ -1044,6 +1056,7 @@ export class AgentManager {
       initialTitle: options.initialTitle,
       workspaceId: options.workspaceId,
       owner: options.owner,
+      recentTurnReceipts: options.recentTurnReceipts,
     });
   }
 
@@ -1068,6 +1081,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      recentTurnReceipts?: AgentTurnReceipt[];
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1087,6 +1101,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      recentTurnReceipts?: AgentTurnReceipt[];
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1532,6 +1547,7 @@ export class AgentManager {
         activeForegroundTurnId: null,
         foregroundTurnWaiters: new Set(),
         finalizedForegroundTurnIds: new Set(),
+        recentTurnReceipts: cloneTurnReceipts(record.recentTurnReceipts),
         unsubscribeSession: null,
         persistence: record.persistence ?? null,
         historyPrimed: true,
@@ -2683,6 +2699,7 @@ export class AgentManager {
       publishWhenReady?: boolean;
       workspaceId?: string;
       owner?: AgentOwner;
+      recentTurnReceipts?: AgentTurnReceipt[];
     },
   ): Promise<ManagedAgent> {
     let registered = false;
@@ -2822,6 +2839,7 @@ export class AgentManager {
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
           owner?: AgentOwner;
+          recentTurnReceipts?: AgentTurnReceipt[];
         }
       | undefined;
   }): ActiveManagedAgent {
@@ -2848,6 +2866,7 @@ export class AgentManager {
       activeForegroundTurnId: null,
       foregroundTurnWaiters: new Set<ForegroundTurnWaiter>(),
       finalizedForegroundTurnIds: new Set<string>(),
+      recentTurnReceipts: cloneTurnReceipts(options?.recentTurnReceipts),
       unsubscribeSession: null,
       persistence: attachPersistenceCwd(
         options?.persistence ?? session.describePersistence(),
@@ -3332,6 +3351,14 @@ export class AgentManager {
 
     const flags: StreamEventFlags = { shouldDispatchEvent: true, shouldNotifyWaiters: true };
 
+    await this.persistIdentifiedTurnReceipt({
+      agent,
+      event,
+      eventTurnId,
+      isForegroundEvent,
+      fromHistory: options?.fromHistory === true,
+    });
+
     const dispatchPromise = this.dispatchStreamEventByType({
       agent,
       event,
@@ -3358,6 +3385,39 @@ export class AgentManager {
     this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
 
     return flags.shouldNotifyWaiters;
+  }
+
+  private async persistIdentifiedTurnReceipt(input: {
+    agent: ActiveManagedAgent;
+    event: AgentStreamEvent;
+    eventTurnId: string | undefined;
+    isForegroundEvent: boolean;
+    fromHistory: boolean;
+  }): Promise<void> {
+    const { agent, event, eventTurnId, isForegroundEvent, fromHistory } = input;
+    if (fromHistory || !isForegroundEvent || !eventTurnId || !isTurnTerminalEvent(event)) return;
+    const clientMessageId = this.runs.getPendingRun(agent.id)?.clientMessageId;
+    if (!clientMessageId) return;
+    const statusByEvent = {
+      turn_completed: "completed",
+      turn_failed: "failed",
+      turn_canceled: "canceled",
+    } as const;
+    const receipt: AgentTurnReceipt = {
+      turnId: eventTurnId,
+      clientMessageId,
+      status: statusByEvent[event.type],
+      error: event.type === "turn_failed" ? event.error : null,
+    };
+    agent.recentTurnReceipts = [
+      ...agent.recentTurnReceipts.filter(
+        (candidate) =>
+          candidate.turnId !== receipt.turnId &&
+          candidate.clientMessageId !== receipt.clientMessageId,
+      ),
+      receipt,
+    ].slice(-50);
+    await this.persistSnapshot(agent);
   }
 
   private traceHandleStreamEventStart(
