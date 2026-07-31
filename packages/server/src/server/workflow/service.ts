@@ -212,6 +212,7 @@ export class WorkflowService {
           ? tx.state.reason
           : "requested";
       tx.state.stopRequested = true;
+      cancelQueuedTurns(tx, reason === "requested" ? "stop_requested" : reason);
       tx.state.status = hasActiveTurns(tx.state) ? "stopping" : "stopped";
       tx.state.reason = reason;
       if (tx.state.status === "stopped") tx.state.completedAt = new Date().toISOString();
@@ -708,19 +709,8 @@ export class WorkflowService {
       active.agentId = agentId;
       role.agentId = agentId;
       if (state.stopRequested) {
-        instance.activeTurn = null;
-        instance.status = "runnable";
-        role.status = "idle";
-        tx.state.loop.iteration -= 1;
-        queueEvent(tx, {
-          type: "turn_not_started",
-          instanceId,
-          flow: active.flow,
-          state: active.state,
-          agent: active.agent,
-          agentId,
-          details: { workflowTurnId, reason: "stop_requested" },
-        });
+        const reason = state.reason === "requested" ? "stop_requested" : state.reason;
+        cancelQueuedTurns(tx, reason ?? "stop_requested");
         finalizeRequestedStop(tx);
         await this.commitTransaction(runId, tx);
         return null;
@@ -1306,6 +1296,7 @@ function requestTerminal(
   status: "complete" | "stopped" | "failed",
   reason: string,
 ): void {
+  cancelQueuedTurns(tx, reason);
   if (hasActiveTurns(tx.state)) {
     tx.state.stopRequested = true;
     tx.state.status = "stopping";
@@ -1323,6 +1314,26 @@ function finalizeRequestedStop(tx: Transaction): void {
     completeState(tx, pending.status, pending.reason);
   } else {
     completeState(tx, "stopped", tx.state.reason ?? "requested");
+  }
+}
+
+function cancelQueuedTurns(tx: Transaction, reason: string): void {
+  for (const instance of Object.values(tx.state.instances)) {
+    const turn = instance.activeTurn;
+    if (!turn || turn.phase !== "queued") continue;
+    instance.activeTurn = null;
+    instance.status = "runnable";
+    requireRole(instance, turn.agent).status = "idle";
+    tx.state.loop.iteration -= 1;
+    queueEvent(tx, {
+      type: "turn_not_started",
+      instanceId: instance.id,
+      flow: turn.flow,
+      state: turn.state,
+      agent: turn.agent,
+      ...(turn.agentId ? { agentId: turn.agentId } : {}),
+      details: { workflowTurnId: turn.workflowTurnId, reason },
+    });
   }
 }
 
@@ -1628,6 +1639,7 @@ function isLimitReason(reason: string | null): reason is "max_iterations" | "max
 function applyLimit(tx: Transaction, reason: string): void {
   tx.state.stopRequested = true;
   tx.state.reason = reason;
+  cancelQueuedTurns(tx, reason);
   tx.state.status = hasActiveTurns(tx.state) ? "stopping" : "stopped";
   tx.state.completedAt = tx.state.status === "stopped" ? new Date().toISOString() : null;
   queueEvent(tx, { type: "limit_reached", details: { reason } });

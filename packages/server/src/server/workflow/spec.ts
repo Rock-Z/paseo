@@ -49,6 +49,7 @@ const PARAMETER_TYPES = new Set([
   "number",
 ]);
 const DEFAULT_FROM = new Set(["current.workspace", "current.worktree", "current.agent"]);
+const CONTEXT_DEFAULT_PARAMETER_TYPES = new Set(["string", "path", "image", "enum"]);
 const SLUG = /^[a-z0-9][a-z0-9-]*$/;
 const AGENT_NAME = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -224,8 +225,12 @@ function validateParameters(value: unknown, issues: Issues): Map<string, JsonObj
     if ("required" in declaration && typeof declaration.required !== "boolean") {
       issues.add(`${path}.required`, "must be a boolean");
     }
-    if ("defaultFrom" in declaration && !DEFAULT_FROM.has(String(declaration.defaultFrom))) {
-      issues.add(`${path}.defaultFrom`, "unsupported source");
+    if ("defaultFrom" in declaration) {
+      if (!DEFAULT_FROM.has(String(declaration.defaultFrom))) {
+        issues.add(`${path}.defaultFrom`, "unsupported source");
+      } else if (PARAMETER_TYPES.has(type) && !CONTEXT_DEFAULT_PARAMETER_TYPES.has(type)) {
+        issues.add(`${path}.defaultFrom`, "requires a string-compatible parameter type");
+      }
     }
     if (
       type === "enum" &&

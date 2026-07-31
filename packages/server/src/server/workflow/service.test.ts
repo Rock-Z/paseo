@@ -845,7 +845,7 @@ describe("WorkflowService runtime", () => {
     service.dispose();
   });
 
-  it("does not submit a queued native turn after stop is acknowledged", async () => {
+  it("cancels a queued native turn without waiting for an unrelated agent to become idle", async () => {
     const spec = baseSpec();
     spec.limits = { maxIterations: 1, maxRuntime: "1h" };
     const { service, adapter } = await setup(spec);
@@ -860,10 +860,7 @@ describe("WorkflowService runtime", () => {
     });
     await adapter.waitForIdleWaits(1);
 
-    await expect(service.stopRun(run.id)).resolves.toMatchObject({ status: "stopping" });
-    releaseIdle();
-
-    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
+    await expect(service.stopRun(run.id)).resolves.toMatchObject({
       status: "stopped",
       reason: "requested",
       resumable: true,
@@ -879,6 +876,8 @@ describe("WorkflowService runtime", () => {
     });
 
     await service.resumeRun(run.id);
+    await adapter.waitForIdleWaits(2);
+    releaseIdle();
     await adapter.waitForStarts(1);
     const resumed = adapter.starts[0];
     await service.emitEvent({

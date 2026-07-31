@@ -183,6 +183,25 @@ describe("workflow spec validation and materialization", () => {
     ).toThrow("parameters.objective: required");
   });
 
+  it.each(["boolean", "integer", "number", "object", "array"])(
+    "rejects a current-context default for a %s parameter",
+    (type) => {
+      const spec = baseSpec();
+      const parameters = spec.parameters as Record<string, unknown>;
+      parameters.contextual = {
+        type,
+        defaultFrom: "current.workspace",
+      };
+
+      const result = validateWorkflowTemplate(spec);
+      expect(result.valid).toBe(false);
+      expect(result.issues).toContainEqual({
+        path: "parameters.contextual.defaultFrom",
+        message: "requires a string-compatible parameter type",
+      });
+    },
+  );
+
   it("rejects unknown fields, broken routes, undeclared parameters, and invalid event schemas", () => {
     const spec = baseSpec();
     spec.unexpected = true;
