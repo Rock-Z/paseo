@@ -248,6 +248,11 @@ describe("workflow spec validation and materialization", () => {
       path: "parameters.notDeclared",
       message: "referenced but not declared",
     });
+
+    const nested = baseSpec();
+    (nested.prompts as Record<string, unknown>).work =
+      "{{ inputs.parameters.timeout }} {{ event.data.parameters.result }}";
+    expect(validateWorkflowTemplate(nested)).toMatchObject({ valid: true, issues: [] });
   });
 
   it("rejects unsupported prompt template tags before a run is saved", () => {
@@ -316,6 +321,66 @@ describe("workflow spec validation and materialization", () => {
     };
 
     expect(validateWorkflowTemplate(spec).valid).toBe(true);
+  });
+
+  it("rejects scheduler-state cycles that can repeat without a turn", () => {
+    const spec = baseSpec();
+    spec.flows = {
+      main: {
+        initial: "loop",
+        states: {
+          loop: {
+            call: { flow: "leaf" },
+            on: { returned: "loop" },
+          },
+        },
+      },
+      leaf: {
+        initial: "finish",
+        states: {
+          finish: { return: { output: "done" } },
+        },
+      },
+    };
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "flows.main.states.loop.on.returned",
+      message: "scheduler state cycle: main.loop -> main.loop",
+    });
+  });
+
+  it("allows a scheduler-state cycle when each pass reaches a turn", () => {
+    const spec = baseSpec();
+    spec.flows = {
+      main: {
+        initial: "loop",
+        states: {
+          loop: {
+            call: { flow: "child" },
+            on: { returned: "loop" },
+          },
+        },
+      },
+      child: {
+        initial: "work",
+        states: {
+          work: {
+            turn: {
+              agent: "worker",
+              prompt: "work",
+              emits: { done: { description: "Finished one pass" } },
+            },
+            on: { done: "finish", "error.agent": "failed", "error.protocol": "failed" },
+          },
+          finish: { return: { output: "done" } },
+          failed: { stop: { reason: "{{ event.message }}" } },
+        },
+      },
+    };
+
+    expect(validateWorkflowTemplate(spec)).toMatchObject({ valid: true, issues: [] });
   });
 
   it("rejects a turn with no emitted events", () => {
@@ -540,6 +605,25 @@ describe("workflow spec validation and materialization", () => {
 
     parameter.type = "integer";
     parameter.default = 2;
+    expect(validateWorkflowTemplate(spec)).toMatchObject({ valid: true, issues: [] });
+  });
+
+  it("requires string parameters for maxRuntime", () => {
+    const spec = baseSpec();
+    const duration: Record<string, unknown> = { type: "integer", default: 2 };
+    (spec.parameters as Record<string, unknown>).duration = duration;
+    spec.limits = {
+      maxIterations: 5,
+      maxRuntime: "{{ parameters.duration }}",
+    };
+
+    expect(validateWorkflowTemplate(spec).issues).toContainEqual({
+      path: "limits.maxRuntime",
+      message: "invalid duration",
+    });
+
+    duration.type = "string";
+    duration.default = "2h";
     expect(validateWorkflowTemplate(spec)).toMatchObject({ valid: true, issues: [] });
   });
 

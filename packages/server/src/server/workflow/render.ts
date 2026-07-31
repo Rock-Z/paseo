@@ -1,8 +1,10 @@
 import { canonicalJson, isJsonObject, type JsonObject } from "./json.js";
 
 const VALUE_PATH = String.raw`[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*`;
-const EXACT_VALUE = new RegExp(String.raw`^\s*\{\{\s*(${VALUE_PATH})\s*(?:\|\s*trim\s*)?\}\}\s*$`);
-const INLINE_VALUE = new RegExp(String.raw`\{\{\s*(${VALUE_PATH})\s*(?:\|\s*trim\s*)?\}\}`, "g");
+const EXACT_VALUE = new RegExp(
+  String.raw`^\s*\{\{\s*(${VALUE_PATH})\s*(?:\|\s*(trim)\s*)?\}\}\s*$`,
+);
+const INLINE_VALUE = new RegExp(String.raw`\{\{\s*(${VALUE_PATH})\s*(?:\|\s*(trim)\s*)?\}\}`, "g");
 const IF_BLOCK = new RegExp(
   String.raw`\{%\s*if\s+(${VALUE_PATH})\s*==\s*(["'])(.*?)\2\s*%\}([\s\S]*?)\{%\s*endif\s*%\}`,
   "g",
@@ -74,7 +76,9 @@ export function renderValue(
     const exact = value.match(EXACT_VALUE);
     if (exact) {
       const resolved = tryResolvePath(context, exact[1]);
-      if (resolved.found) return resolved.value;
+      if (resolved.found) {
+        return exact[2] === "trim" ? stringify(resolved.value).trim() : resolved.value;
+      }
       if (options.preserveUndefined) return value;
       throw new Error(`undefined workflow value: ${exact[1]}`);
     }
@@ -98,9 +102,12 @@ function renderString(
 ): string {
   const issue = interpolationIssue(value);
   if (issue) throw new Error(`unsupported workflow template: ${issue}`);
-  return value.replace(INLINE_VALUE, (match, path: string) => {
+  return value.replace(INLINE_VALUE, (match, path: string, filter: string | undefined) => {
     const resolved = tryResolvePath(context, path);
-    if (resolved.found) return stringify(resolved.value);
+    if (resolved.found) {
+      const rendered = stringify(resolved.value);
+      return filter === "trim" ? rendered.trim() : rendered;
+    }
     if (options.preserveUndefined) return match;
     throw new Error(`undefined workflow value: ${path}`);
   });

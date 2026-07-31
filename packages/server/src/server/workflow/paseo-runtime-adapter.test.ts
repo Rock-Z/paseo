@@ -373,6 +373,52 @@ describe("PaseoWorkflowRuntimeAdapter", () => {
     },
   );
 
+  it("validates thinking against the provider default model", async () => {
+    const getProvider = vi.fn(async () => ({
+      status: "ready",
+      models: [
+        {
+          provider: "pi",
+          id: "default-model",
+          label: "Default model",
+          isDefault: true,
+          thinkingOptions: [
+            { id: "low", label: "Low" },
+            { id: "high", label: "High" },
+          ],
+        },
+      ],
+    }));
+    const adapter = new PaseoWorkflowRuntimeAdapter({
+      agentManager: {} as never,
+      agentStorage: {} as never,
+      providerSnapshotManager: {
+        getProvider,
+        resolveCreateConfig: vi.fn(async () => ({})),
+      } as never,
+      workspaceRegistry: {} as never,
+      createAgent: (() => undefined) as never,
+      createPaseoWorktree: (() => undefined) as never,
+      logger: {} as never,
+    });
+    const spec: JsonObject = {
+      bindings: { worktree: process.cwd(), agents: {} },
+      workspace: { createWorktree: { cwd: process.cwd() } },
+      agents: {
+        worker: {
+          createAgent: {
+            provider: "pi",
+            settings: { thinkingOptionId: "unsupported" },
+          },
+        },
+      },
+    };
+
+    await expect(adapter.validateMaterializedSpec(spec, {})).rejects.toThrow(
+      "agents.worker.createAgent.settings.thinkingOptionId: unsupported is not available",
+    );
+  });
+
   it("normalizes validated mode and thinking aliases before creating an agent", async () => {
     const createAgent = vi.fn(async () => ({ snapshot: { id: "agent-created" } }));
     const adapter = new PaseoWorkflowRuntimeAdapter({

@@ -11,6 +11,14 @@ describe("workflow rendering", () => {
   it("preserves native values for exact placeholders and renders inline JSON canonically", () => {
     expect(renderValue("{{ event.data.branches }}", context)).toEqual(["a", "b"]);
     expect(renderValue("branches={{ event.data.branches }}", context)).toBe('branches=["a","b"]');
+    expect(
+      renderValue("{{ inputs.objective | trim }}", { inputs: { objective: "  done  " } }),
+    ).toBe("done");
+    expect(
+      renderPrompt("result={{ inputs.objective | trim }}", {
+        inputs: { objective: "  done  " },
+      }),
+    ).toBe("result=done");
   });
 
   it("renders the conditional form used by built-in workflows", () => {

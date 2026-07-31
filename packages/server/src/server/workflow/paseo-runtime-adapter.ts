@@ -330,10 +330,11 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     if (entry.status !== "ready") {
       throw new Error(`${path}.provider: ${entry.error ?? `${provider} is unavailable`}`);
     }
-    const requestedModel = model
-      ? (entry.models ?? []).find((candidate) => candidate.id === model)
-      : undefined;
-    if (model && (entry.models?.length ?? 0) > 0 && !requestedModel) {
+    const models = entry.models ?? [];
+    const selectedModel = model
+      ? models.find((candidate) => candidate.id === model)
+      : (models.find((candidate) => candidate.isDefault) ?? models[0]);
+    if (model && models.length > 0 && !selectedModel) {
       throw new Error(`${path}.model: model ${model} is not available for ${provider}`);
     }
     const settings = isObject(create.settings) ? create.settings : {};
@@ -347,7 +348,7 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
       unattended: false,
     });
     const thinking = firstString(settings.thinkingOptionId, settings.thinking);
-    validateThinkingOption(requestedModel, thinking, path);
+    validateThinkingOption(selectedModel, thinking, path);
   }
 
   private async loadAgent(agentId: string): Promise<ManagedAgent> {

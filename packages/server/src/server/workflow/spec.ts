@@ -55,7 +55,7 @@ const AGENT_NAME = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DURATION = /^[1-9][0-9]*(s|m|h|d)$/;
 const TEMPLATE_EXPRESSION = /{{([\s\S]*?)}}|{%([\s\S]*?)%}/g;
-const PARAMETER_REFERENCE = /parameters\.([A-Za-z_][A-Za-z0-9_]*)/g;
+const PARAMETER_REFERENCE = /^\s*(?:if\s+)?parameters\.([A-Za-z_][A-Za-z0-9_]*)(?:\b|$)/;
 const EXACT_PARAMETER_REFERENCE = /^\s*{{\s*parameters\.([A-Za-z_][A-Za-z0-9_]*)\s*}}\s*$/;
 const Ajv2020Constructor = Ajv2020 as unknown as {
   new (options?: { strict?: boolean }): {
@@ -273,9 +273,8 @@ function collectTemplateExpressions(
     const issue = templateIssue(value, path.startsWith("prompts."));
     if (issue) issues.add(path || "$", issue);
     for (const expression of value.matchAll(TEMPLATE_EXPRESSION)) {
-      for (const match of (expression[1] ?? expression[2] ?? "").matchAll(PARAMETER_REFERENCE)) {
-        found.add(match[1]);
-      }
+      const match = (expression[1] ?? expression[2] ?? "").match(PARAMETER_REFERENCE);
+      if (match) found.add(match[1]);
     }
     return;
   }
@@ -526,8 +525,7 @@ function validateLimits(
   }
   if (
     value.maxRuntime !== undefined &&
-    !DURATION.test(String(value.maxRuntime)) &&
-    !isExactParameter(value.maxRuntime)
+    !isDurationOrStringParameter(value.maxRuntime, parameters)
   ) {
     issues.add("limits.maxRuntime", "invalid duration");
   }
@@ -580,7 +578,7 @@ function validateFlows(
       );
     }
   }
-  validateAcyclicFlowCalls(value, flowNames, issues);
+  validateSchedulerCycles(value, flowNames, issues);
 }
 
 interface FlowCallEdge {
@@ -588,53 +586,77 @@ interface FlowCallEdge {
   path: string;
 }
 
-function validateAcyclicFlowCalls(
+interface SchedulerCall {
+  action: JsonObject;
+  actionPath: "call" | "map.call";
+  continuationEvent: "returned" | "joined";
+}
+
+function schedulerCall(state: JsonObject): SchedulerCall | null {
+  if (isObject(state.call)) {
+    return { action: state.call, actionPath: "call", continuationEvent: "returned" };
+  }
+  if (isObject(state.map) && isObject(state.map.call)) {
+    return { action: state.map.call, actionPath: "map.call", continuationEvent: "joined" };
+  }
+  return null;
+}
+
+function createZeroTurnReturnResolver(
+  flows: JsonObject,
+  flowNames: ReadonlySet<string>,
+): (flowName: string) => boolean {
+  const memo = new Map<string, boolean>();
+  const evaluating = new Set<string>();
+  const resolve = (flowName: string): boolean => {
+    const memoized = memo.get(flowName);
+    if (memoized !== undefined) return memoized;
+    if (evaluating.has(flowName)) return false;
+    evaluating.add(flowName);
+    const flow = flows[flowName];
+    let result = false;
+    if (isObject(flow) && isObject(flow.states) && typeof flow.initial === "string") {
+      const visitedStates = new Set<string>();
+      let stateName: string | undefined = flow.initial;
+      while (stateName && !visitedStates.has(stateName)) {
+        visitedStates.add(stateName);
+        const state: unknown = flow.states[stateName];
+        if (!isObject(state)) break;
+        if (isObject(state.return)) {
+          result = true;
+          break;
+        }
+        const scheduler = schedulerCall(state);
+        if (!scheduler) break;
+        const routes: JsonObject = isObject(state.on) ? state.on : {};
+        if (scheduler.actionPath === "call") {
+          if (
+            typeof scheduler.action.flow !== "string" ||
+            !flowNames.has(scheduler.action.flow) ||
+            !resolve(scheduler.action.flow)
+          ) {
+            break;
+          }
+          stateName = typeof routes.returned === "string" ? routes.returned : undefined;
+        } else {
+          stateName = typeof routes.joined === "string" ? routes.joined : undefined;
+        }
+      }
+    }
+    evaluating.delete(flowName);
+    memo.set(flowName, result);
+    return result;
+  };
+  return resolve;
+}
+
+function validateSchedulerCycles(
   flows: JsonObject,
   flowNames: ReadonlySet<string>,
   issues: Issues,
 ): void {
-  const calls = new Map<string, FlowCallEdge[]>();
-  for (const [flowName, flowValue] of Object.entries(flows)) {
-    const edges: FlowCallEdge[] = [];
-    if (
-      !isObject(flowValue) ||
-      !isObject(flowValue.states) ||
-      typeof flowValue.initial !== "string"
-    ) {
-      calls.set(flowName, edges);
-      continue;
-    }
-    const visitedStates = new Set<string>();
-    let stateName: string | undefined = flowValue.initial;
-    while (stateName && !visitedStates.has(stateName)) {
-      visitedStates.add(stateName);
-      const stateValue: unknown = flowValue.states[stateName];
-      if (!isObject(stateValue)) break;
-      let action: JsonObject | null = null;
-      let actionPath: "call" | "map.call" | null = null;
-      let continuationEvent: "returned" | "joined" | null = null;
-      if (isObject(stateValue.call)) {
-        action = stateValue.call;
-        actionPath = "call";
-        continuationEvent = "returned";
-      } else if (isObject(stateValue.map) && isObject(stateValue.map.call)) {
-        action = stateValue.map.call;
-        actionPath = "map.call";
-        continuationEvent = "joined";
-      }
-      if (!action) break;
-      if (typeof action.flow === "string" && flowNames.has(action.flow)) {
-        edges.push({
-          target: action.flow,
-          path: `flows.${flowName}.states.${stateName}.${actionPath}.flow`,
-        });
-      }
-      const routes: JsonObject = isObject(stateValue.on) ? stateValue.on : {};
-      const continuation: unknown = continuationEvent ? routes[continuationEvent] : undefined;
-      stateName = typeof continuation === "string" ? continuation : undefined;
-    }
-    calls.set(flowName, edges);
-  }
+  const returnsWithoutTurn = createZeroTurnReturnResolver(flows, flowNames);
+  const calls = collectZeroTurnFlowCalls(flows, flowNames, returnsWithoutTurn, issues);
 
   const visited = new Set<string>();
   const stack: string[] = [];
@@ -659,6 +681,67 @@ function validateAcyclicFlowCalls(
     visited.add(flowName);
   };
   for (const flowName of flowNames) visit(flowName);
+}
+
+function collectZeroTurnFlowCalls(
+  flows: JsonObject,
+  flowNames: ReadonlySet<string>,
+  returnsWithoutTurn: (flowName: string) => boolean,
+  issues: Issues,
+): Map<string, FlowCallEdge[]> {
+  const calls = new Map<string, FlowCallEdge[]>();
+  for (const [flowName, flowValue] of Object.entries(flows)) {
+    const edges: FlowCallEdge[] = [];
+    if (
+      !isObject(flowValue) ||
+      !isObject(flowValue.states) ||
+      typeof flowValue.initial !== "string"
+    ) {
+      calls.set(flowName, edges);
+      continue;
+    }
+    const stateStack: string[] = [];
+    const stateIndexes = new Map<string, number>();
+    let stateName: string | undefined = flowValue.initial;
+    while (stateName) {
+      stateIndexes.set(stateName, stateStack.length);
+      stateStack.push(stateName);
+      const stateValue: unknown = flowValue.states[stateName];
+      if (!isObject(stateValue)) break;
+      const scheduler = schedulerCall(stateValue);
+      if (!scheduler) break;
+      const { action, actionPath, continuationEvent } = scheduler;
+      if (typeof action.flow === "string" && flowNames.has(action.flow)) {
+        edges.push({
+          target: action.flow,
+          path: `flows.${flowName}.states.${stateName}.${actionPath}.flow`,
+        });
+      }
+      const canContinue =
+        actionPath === "map.call" ||
+        (typeof action.flow === "string" &&
+          flowNames.has(action.flow) &&
+          returnsWithoutTurn(action.flow));
+      if (!canContinue) break;
+      const routes: JsonObject = isObject(stateValue.on) ? stateValue.on : {};
+      const continuation: unknown = continuationEvent ? routes[continuationEvent] : undefined;
+      if (typeof continuation !== "string") break;
+      const cycleStart = stateIndexes.get(continuation);
+      if (cycleStart !== undefined) {
+        const cycle = [...stateStack.slice(cycleStart), continuation]
+          .map((state) => `${flowName}.${state}`)
+          .join(" -> ");
+        issues.add(
+          `flows.${flowName}.states.${stateName}.on.${continuationEvent}`,
+          `scheduler state cycle: ${cycle}`,
+        );
+        break;
+      }
+      stateName = continuation;
+    }
+    calls.set(flowName, edges);
+  }
+  return calls;
 }
 
 function validateState(
@@ -1054,8 +1137,15 @@ function isPositiveIntegerOrParameter(
   return !declaration || parameterType(declaration) === "integer";
 }
 
-function isExactParameter(value: unknown): boolean {
-  return exactParameterName(value) !== null;
+function isDurationOrStringParameter(
+  value: unknown,
+  parameters: ReadonlyMap<string, JsonObject>,
+): boolean {
+  if (typeof value === "string" && DURATION.test(value)) return true;
+  const name = exactParameterName(value);
+  if (!name) return false;
+  const declaration = parameters.get(name);
+  return !declaration || parameterType(declaration) === "string";
 }
 
 function exactParameterName(value: unknown): string | null {
