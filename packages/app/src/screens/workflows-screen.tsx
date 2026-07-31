@@ -131,6 +131,7 @@ function WorkflowHostScreen({
   const [editorOpen, setEditorOpen] = useState(false);
   const [editor, setEditor] = useState("");
   const selectedRunIdRef = useRef<string | null>(null);
+  const detailsRequestRef = useRef(0);
   const selectedSpecRequestRef = useRef(0);
 
   const client = useHostRuntimeClient(serverId);
@@ -164,8 +165,9 @@ function WorkflowHostScreen({
 
   const refreshDetails = useCallback(
     async (runId: string) => {
+      const request = ++detailsRequestRef.current;
       if (!client) {
-        if (selectedRunIdRef.current === runId) {
+        if (selectedRunIdRef.current === runId && detailsRequestRef.current === request) {
           setAction({
             kind: "error",
             message: "The host is disconnected. Reconnect, then try again.",
@@ -175,12 +177,14 @@ function WorkflowHostScreen({
       }
       try {
         const payload = await client.workflowRunInspect(runId);
-        if (selectedRunIdRef.current !== runId) return false;
+        if (selectedRunIdRef.current !== runId || detailsRequestRef.current !== request) {
+          return false;
+        }
         if (payload.error) throw new Error(payload.error);
         if (payload.details) setDetails(payload.details);
         return true;
       } catch (error) {
-        if (selectedRunIdRef.current === runId) {
+        if (selectedRunIdRef.current === runId && detailsRequestRef.current === request) {
           setAction({ kind: "error", message: errorMessage(error) });
         }
         return false;
@@ -191,6 +195,7 @@ function WorkflowHostScreen({
 
   useEffect(() => {
     selectedSpecRequestRef.current += 1;
+    detailsRequestRef.current += 1;
     selectedRunIdRef.current = null;
     setDetails(null);
     setSelectedSpec(null);

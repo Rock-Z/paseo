@@ -483,6 +483,19 @@ describe("workflow spec validation and materialization", () => {
     );
   });
 
+  it("rejects a whitespace-only native agent provider", () => {
+    const spec = baseSpec();
+    const agents = spec.agents as Record<string, Record<string, Record<string, unknown>>>;
+    agents.worker.createAgent.provider = "   ";
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "agents.worker.createAgent.provider",
+      message: "must be a non-empty string",
+    });
+  });
+
   it.each(["mode", "modeId", "thinking", "thinkingOptionId"])(
     "rejects an empty %s agent setting",
     (field) => {
@@ -563,6 +576,37 @@ describe("workflow spec validation and materialization", () => {
     };
     expect(validateWorkflowTemplate(spec)).toMatchObject({ valid: true, issues: [] });
   });
+
+  it.each(["__proto__", "constructor", "prototype"])(
+    "rejects prototype-sensitive map group %j",
+    (group) => {
+      const spec = baseSpec();
+      const flows = spec.flows as Record<string, Record<string, unknown>>;
+      flows.child = {
+        initial: "finish",
+        inputs: {},
+        states: { finish: { return: { output: "{{ inputs }}" } } },
+      };
+      const states = flows.main.states as Record<string, Record<string, unknown>>;
+      states.work = {
+        map: {
+          group,
+          items: "{{ inputs.items }}",
+          as: "item",
+          call: { flow: "child", with: { item: "{{ item }}" } },
+          join: "all",
+        },
+        on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+      };
+
+      const result = validateWorkflowTemplate(spec);
+      expect(result.valid).toBe(false);
+      expect(result.issues).toContainEqual({
+        path: "flows.main.states.work.map.group",
+        message: "must not be a prototype-sensitive name",
+      });
+    },
+  );
 
   it("requires integer parameters for numeric-only fields", () => {
     const spec = baseSpec();

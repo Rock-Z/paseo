@@ -50,6 +50,7 @@ const PARAMETER_TYPES = new Set([
 ]);
 const DEFAULT_FROM = new Set(["current.workspace", "current.worktree", "current.agent"]);
 const CONTEXT_DEFAULT_PARAMETER_TYPES = new Set(["string", "path", "image", "enum"]);
+const PROTOTYPE_SENSITIVE_NAMES = new Set(["__proto__", "constructor", "prototype"]);
 const SLUG = /^[a-z0-9][a-z0-9-]*$/;
 const AGENT_NAME = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -438,7 +439,7 @@ function validateCreateAgent(create: JsonObject, path: string, issues: Issues): 
   if (typeof create.title !== "string" || create.title.length === 0) {
     issues.add(`${path}.title`, "must be a non-empty string");
   }
-  if (typeof create.provider !== "string" || create.provider.length === 0) {
+  if (typeof create.provider !== "string" || !create.provider.trim()) {
     issues.add(`${path}.provider`, "must be a non-empty string");
   }
   if (create.model !== undefined && (typeof create.model !== "string" || !create.model)) {
@@ -969,6 +970,8 @@ function validateMap(
   issues.unknown(value, path, new Set(["group", "items", "as", "call", "join", "concurrency"]));
   if (typeof value.group !== "string" || !value.group.trim()) {
     issues.add(`${path}.group`, "must be a non-empty string");
+  } else if (PROTOTYPE_SENSITIVE_NAMES.has(value.group)) {
+    issues.add(`${path}.group`, "must not be a prototype-sensitive name");
   }
   if (typeof value.items !== "string" || !value.items.trim()) {
     issues.add(`${path}.items`, "must be a non-empty string");

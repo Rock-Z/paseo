@@ -120,9 +120,7 @@ function interpolationIssue(template: string): string | null {
       return `has unsupported interpolation: ${expression}`;
     }
   }
-  return hasUnbalancedSyntax(template.replace(ALL_VALUES, ""), "{{", "}}")
-    ? "has an unbalanced interpolation"
-    : null;
+  return template.replace(ALL_VALUES, "").includes("{{") ? "has an unbalanced interpolation" : null;
 }
 
 function hasUnbalancedSyntax(value: string, open: string, close: string): boolean {

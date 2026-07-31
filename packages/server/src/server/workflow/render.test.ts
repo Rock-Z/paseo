@@ -35,6 +35,12 @@ describe("workflow rendering", () => {
     ).toContain("Prior feedback: Tighten the proof");
   });
 
+  it("preserves literal JSON closing braces outside interpolation", () => {
+    const prompt =
+      'PASEO_WORKFLOW_TEST_SCRIPT: {"delayMs":15000,"rules":{"done":[{"event":"done"}]}}';
+    expect(renderPrompt(prompt, context)).toBe(prompt);
+  });
+
   it("fails closed on missing values and unsupported expressions", () => {
     expect(() => renderPrompt("{{ event.data.missing }}", context)).toThrow(
       "undefined workflow value",
@@ -44,6 +50,9 @@ describe("workflow rendering", () => {
     );
     expect(() => renderPrompt("{{ inputs.objective | uppercase }}", context)).toThrow(
       "unsupported workflow template",
+    );
+    expect(() => renderPrompt("{{ inputs.objective", context)).toThrow(
+      "has an unbalanced interpolation",
     );
   });
 });

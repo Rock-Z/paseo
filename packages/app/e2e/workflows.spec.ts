@@ -132,27 +132,24 @@ test.describe("Native workflows", () => {
     }
   });
 
-  test("keeps the latest run selected when an older inspection arrives late", async ({ page }) => {
+  test("keeps the latest same-run inspection when an older response arrives late", async ({
+    page,
+  }) => {
     const workspace = await seedWorkspace({ repoPrefix: "workflow-selection-" });
     const name = uniqueWorkflowName("selection");
     let gate: WorkflowResponseGate | null = null;
     try {
       await enablePaseoTools(workspace.client);
-      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 0 }));
-      const firstRunId = await startWorkflow(workspace.client, {
+      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 15_000 }));
+      const runId = await startWorkflow(workspace.client, {
         workflowId: name,
         workspaceId: workspace.workspaceId,
       });
-      await waitForWorkflow(workspace.client, firstRunId, ["complete"]);
-      const secondRunId = await startWorkflow(workspace.client, {
-        workflowId: name,
-        workspaceId: workspace.workspaceId,
-      });
-      await waitForWorkflow(workspace.client, secondRunId, ["complete"]);
+      await waitForActiveTurn(workspace.client, runId);
 
       gate = await delayWorkflowResponse(
         page,
-        (message) => workflowInspectResponseRunId(message) === firstRunId,
+        (message) => workflowInspectResponseRunId(message) === runId,
       );
       await page.goto(
         buildWorkflowsRoute({
@@ -160,18 +157,22 @@ test.describe("Native workflows", () => {
           workspaceId: workspace.workspaceId,
         }),
       );
-      await expect(page.getByTestId(`workflow-run-${firstRunId}`)).toBeVisible({
+      await expect(page.getByTestId(`workflow-run-${runId}`)).toBeVisible({
         timeout: 30_000,
       });
-      await page.getByTestId(`workflow-run-${firstRunId}`).click();
+      await page.getByTestId(`workflow-run-${runId}`).click();
       await gate.waitForDelayedResponse();
-      await page.getByTestId(`workflow-run-${secondRunId}`).click();
-      await expect(page.getByTestId("workflow-run-details")).toContainText(secondRunId);
+      await waitForWorkflow(workspace.client, runId, ["complete"]);
+      await page.getByTestId(`workflow-run-${runId}`).click();
+      await expect(
+        page.getByTestId("workflow-run-details").getByText("complete", { exact: true }),
+      ).toBeVisible();
 
       gate.release();
       await flushBrowserFrames(page);
-      await expect(page.getByTestId("workflow-run-details")).toContainText(secondRunId);
-      await expect(page.getByTestId("workflow-run-details")).not.toContainText(firstRunId);
+      await expect(
+        page.getByTestId("workflow-run-details").getByText("complete", { exact: true }),
+      ).toBeVisible();
     } finally {
       gate?.release();
       await page.goto("about:blank").catch(() => undefined);
