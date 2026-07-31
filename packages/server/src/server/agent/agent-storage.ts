@@ -33,6 +33,13 @@ const PERSISTENCE_HANDLE_SCHEMA = z
   .nullable()
   .optional();
 
+const AGENT_TURN_RECEIPT_SCHEMA = z.object({
+  turnId: z.string(),
+  clientMessageId: z.string(),
+  status: z.enum(["completed", "failed", "canceled"]),
+  error: z.string().nullable(),
+});
+
 const STORED_AGENT_SCHEMA = z.object({
   id: z.string(),
   provider: z.string(),
@@ -66,6 +73,7 @@ const STORED_AGENT_SCHEMA = z.object({
   internal: z.boolean().optional(),
   archivedAt: z.string().nullable().optional(),
   owner: AgentOwnerSchema.optional(),
+  recentTurnReceipts: z.array(AGENT_TURN_RECEIPT_SCHEMA).max(50).optional(),
 });
 
 export type SerializableAgentConfig = Pick<

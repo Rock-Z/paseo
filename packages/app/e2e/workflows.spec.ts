@@ -1,0 +1,1262 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import type { TestInfo } from "@playwright/test";
+import type { WorkflowRunDetails } from "@getpaseo/protocol/workflow/types";
+import { expect, test, type Page } from "./fixtures";
+import { gotoAppShell } from "./helpers/app";
+import { addConnectedHostAndReload, waitForConnectedHost } from "./helpers/hosts";
+import { type IsolatedHostDaemon, startIsolatedHostDaemon } from "./helpers/isolated-host-daemon";
+import { connectSeedClient, seedWorkspace, type SeedDaemonClient } from "./helpers/seed-client";
+import { getServerId } from "./helpers/server-id";
+import { createTempGitRepo } from "./helpers/workspace";
+import { daemonWsRoutePattern } from "./helpers/daemon-port";
+import {
+  buildFanoutWorkflow,
+  buildSingleTurnWorkflow,
+  buildTwoTurnWorkflow,
+  goalDemoObjective,
+  reviewedGoalDemoObjective,
+  saveWorkflow,
+  startWorkflow,
+  waitForWorkflow,
+} from "./helpers/workflows";
+import { buildWorkflowsRoute } from "../src/utils/host-routes";
+
+test.describe("Native workflows", () => {
+  test.describe.configure({ timeout: 180_000 });
+
+  test("imports JSON, validates, launches, monitors audit data, and opens the native agent", async ({
+    page,
+  }, testInfo) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-ui-" });
+    const name = uniqueWorkflowName("ui");
+    const spec = buildTwoTurnWorkflow({ name, delayMs: 1_500 });
+    const parameters = spec.parameters as Record<string, unknown>;
+    parameters.optionalNote = {
+      type: "string",
+      description: "Optional launch note",
+      default: null,
+    };
+    try {
+      await enablePaseoTools(workspace.client);
+      await page.goto(buildWorkflowsRoute({ serverId: "removed-workflow-host" }));
+      await expect(page.getByTestId("workflows-new-json")).toBeVisible({ timeout: 30_000 });
+
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByText("Workflows", { exact: true }).last()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      await page.getByTestId("workflow-spec-goal").click();
+      const workspaceBinding = page.getByTestId("workflow-param-workspaceRef").getByRole("textbox");
+      await page.getByTestId("workflow-param-workspaceRef-null").click();
+      await expect(workspaceBinding).toHaveValue("null (explicit)");
+      await expect(page.getByTestId("workflow-param-workspaceRef-null")).toContainText(
+        "Use current default",
+      );
+      await page.getByTestId("workflow-param-workspaceRef-null").click();
+      await expect(workspaceBinding).toHaveValue("");
+
+      await page.getByTestId("workflows-new-json").click();
+      const editor = page.getByLabel("Workflow JSON");
+      await editor.fill("{");
+      await page.getByTestId("workflow-json-validate").click();
+      await expect(page.getByTestId("workflows-action-error")).toContainText("JSON");
+
+      await editor.fill(JSON.stringify(spec));
+      await page.getByTestId("workflow-json-validate").click();
+      await expect(page.getByTestId("workflows-action-success")).toContainText(
+        "Workflow JSON is valid",
+      );
+      await page.getByTestId("workflow-json-save").click();
+      await expect(page.getByTestId("workflows-action-success")).toContainText(`Saved ${name}`);
+
+      await page.getByTestId(`workflow-spec-${name}`).click();
+      await expect(page.getByTestId("workflow-launch-form")).toBeVisible();
+      await expect(page.getByTestId("workflow-param-workspaceRef")).toContainText(
+        "current.workspace",
+      );
+      const optionalNote = page.getByTestId("workflow-param-optionalNote").getByRole("textbox");
+      await expect(optionalNote).toBeDisabled();
+      await expect(page.getByTestId("workflow-param-optionalNote-null")).toContainText(
+        "Enter value",
+      );
+      await page.getByTestId("workflow-param-optionalNote-null").click();
+      await optionalNote.fill("custom note");
+      await page.getByTestId("workflow-launch-submit").click();
+      await expect(page.getByTestId("workflows-action-success")).toContainText("Queued wfr_");
+
+      const runId = await findRunId(workspace.client, name);
+      await expect(page.getByTestId(`workflow-run-${runId}`)).toBeVisible();
+      await expect(page.getByTestId("workflow-run-details")).toContainText(/queued|running/);
+      await captureEvidence(page, testInfo, "workflows-browser-running");
+
+      const complete = await waitForWorkflow(workspace.client, runId, ["complete"]);
+      expect(complete.state.result).toBe("ordered result");
+      expect(acceptedEvents(complete)).toEqual(["next", "done"]);
+      expect(complete.prompts).toHaveLength(2);
+
+      await page.getByTestId("workflows-refresh").click();
+      await page.getByTestId(`workflow-run-${runId}`).click();
+      await expect(page.getByTestId("workflow-run-details")).toContainText("complete");
+      await expect(page.getByTestId("workflow-run-details")).toContainText("event_accepted: done");
+      await expect(page.getByText("Rendered prompts (2)", { exact: true })).toBeVisible();
+      await captureEvidence(page, testInfo, "workflows-browser-complete");
+
+      const workspaceId = complete.run.workspaceIds[0];
+      expect(workspaceId).toBeTruthy();
+      await page.getByRole("button", { name: workspaceId }).click();
+      await expect(page).toHaveURL(/\/workspace\//);
+      await expect(page).not.toHaveURL(/\/workflows/);
+
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await page.getByTestId(`workflow-run-${runId}`).click();
+      const agentId = complete.run.agentIds[0];
+      expect(agentId).toBeTruthy();
+      await page.getByRole("button", { name: agentId }).click();
+      await expect(page).toHaveURL(/\/workspace\//);
+      await expect(page).not.toHaveURL(/\/workflows/);
+    } finally {
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("keeps the latest same-run inspection when an older response arrives late", async ({
+    page,
+  }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-selection-" });
+    const name = uniqueWorkflowName("selection");
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 15_000 }));
+      const runId = await startWorkflow(workspace.client, {
+        workflowId: name,
+        workspaceId: workspace.workspaceId,
+      });
+      await waitForActiveTurn(workspace.client, runId);
+
+      gate = await delayWorkflowResponse(
+        page,
+        (message) => workflowInspectResponseRunId(message) === runId,
+      );
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByTestId(`workflow-run-${runId}`)).toBeVisible({
+        timeout: 30_000,
+      });
+      await page.getByTestId(`workflow-run-${runId}`).click();
+      await gate.waitForDelayedResponse();
+      await waitForWorkflow(workspace.client, runId, ["complete"]);
+      await page.getByTestId(`workflow-run-${runId}`).click();
+      await expect(
+        page.getByTestId("workflow-run-details").getByText("complete", { exact: true }),
+      ).toBeVisible();
+
+      gate.release();
+      await flushBrowserFrames(page);
+      await expect(
+        page.getByTestId("workflow-run-details").getByText("complete", { exact: true }),
+      ).toBeVisible();
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("serializes slow run-list polls and catches up after the response", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-list-order-" });
+    const name = uniqueWorkflowName("list-order");
+    let inspectResponses = 0;
+    let runListRequests = 0;
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 45_000 }));
+      const runId = await startWorkflow(workspace.client, {
+        workflowId: name,
+        workspaceId: workspace.workspaceId,
+      });
+      await waitForActiveTurn(workspace.client, runId);
+
+      gate = await delayWorkflowResponse(page, isWorkflowRunListResponse, {
+        skip: 1,
+        onServerMessage: (message) => {
+          if (workflowInspectResponseRunId(message) === runId) inspectResponses += 1;
+        },
+        onClientMessage: (message) => {
+          if (isWorkflowRunListRequest(message)) runListRequests += 1;
+        },
+      });
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      const runCard = page.getByTestId(`workflow-run-${runId}`);
+      await expect(runCard.getByText("running", { exact: true })).toBeVisible({
+        timeout: 30_000,
+      });
+      await runCard.click();
+      await expect(
+        page.getByTestId("workflow-run-details").getByText("running", { exact: true }),
+      ).toBeVisible();
+      await expect.poll(() => inspectResponses).toBe(1);
+      await gate.waitForDelayedResponse();
+      expect(inspectResponses).toBe(1);
+      await page.waitForTimeout(3_200);
+      expect(runListRequests).toBe(2);
+      await waitForWorkflow(workspace.client, runId, ["complete"]);
+      await expect(runCard.getByText("running", { exact: true })).toBeVisible();
+
+      gate.release();
+      await expect(runCard.getByText("complete", { exact: true })).toBeVisible({
+        timeout: 10_000,
+      });
+      await expect(
+        page.getByTestId("workflow-run-details").getByText("complete", { exact: true }),
+      ).toBeVisible();
+      await expect.poll(() => inspectResponses).toBe(2);
+      expect(runListRequests).toBeGreaterThanOrEqual(3);
+      await flushBrowserFrames(page);
+      await expect(runCard.getByText("complete", { exact: true })).toBeVisible();
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("forces a post-launch list refresh across a slow poll", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-launch-refresh-" });
+    const name = uniqueWorkflowName("launch-refresh");
+    let runListRequests = 0;
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 30_000 }));
+      const existingRunId = await startWorkflow(workspace.client, {
+        workflowId: name,
+        workspaceId: workspace.workspaceId,
+      });
+      await waitForActiveTurn(workspace.client, existingRunId);
+
+      gate = await delayWorkflowResponse(page, isWorkflowRunListResponse, {
+        skip: 1,
+        onClientMessage: (message) => {
+          if (isWorkflowRunListRequest(message)) runListRequests += 1;
+        },
+      });
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByTestId(`workflow-run-${existingRunId}`)).toBeVisible({
+        timeout: 30_000,
+      });
+      await page.getByTestId(`workflow-spec-${name}`).click();
+      await expect(page.getByTestId("workflow-launch-form")).toBeVisible();
+      await gate.waitForDelayedResponse();
+      expect(runListRequests).toBe(2);
+
+      const before = await workspace.client.workflowRunList();
+      expect(before.error).toBeNull();
+      const beforeIds = new Set(before.runs.map((run) => run.id));
+      await page.getByTestId("workflow-launch-submit").click();
+      await expect(page.getByTestId("workflows-action-success")).toContainText("Queued wfr_");
+
+      let launchedRunId: string | null = null;
+      await expect
+        .poll(async () => {
+          const payload = await workspace.client.workflowRunList();
+          if (payload.error) throw new Error(payload.error);
+          for (const run of payload.runs) {
+            if (!beforeIds.has(run.id)) {
+              launchedRunId = run.id;
+              break;
+            }
+          }
+          return launchedRunId;
+        })
+        .not.toBeNull();
+      if (!launchedRunId) throw new Error("launched workflow run was not listed");
+
+      await expect(page.getByTestId(`workflow-run-${launchedRunId}`)).toBeVisible();
+      expect(runListRequests).toBe(3);
+      gate.release();
+      await flushBrowserFrames(page);
+      await expect(page.getByTestId(`workflow-run-${launchedRunId}`)).toBeVisible();
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("refreshes selected details when a terminal status shares the running timestamp", async ({
+    page,
+  }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-equal-timestamp-" });
+    const name = uniqueWorkflowName("equal-timestamp");
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 45_000 }));
+      const runId = await startWorkflow(workspace.client, {
+        workflowId: name,
+        workspaceId: workspace.workspaceId,
+      });
+      await waitForActiveTurn(workspace.client, runId);
+      const runningUpdatedAt = (await inspectRequired(workspace.client, runId)).run.updatedAt;
+      await transformWorkflowResponses(page, (message) =>
+        rewriteRunListTimestamp(message, runId, "complete", runningUpdatedAt),
+      );
+
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      const runCard = page.getByTestId(`workflow-run-${runId}`);
+      await expect(runCard.getByText("running", { exact: true })).toBeVisible({
+        timeout: 30_000,
+      });
+      await runCard.click();
+      const details = page.getByTestId("workflow-run-details");
+      await expect(details.getByText("running", { exact: true })).toBeVisible();
+
+      await waitForWorkflow(workspace.client, runId, ["complete"], 60_000);
+      await expect(runCard.getByText("complete", { exact: true })).toBeVisible({
+        timeout: 10_000,
+      });
+      await expect(details.getByText("complete", { exact: true })).toBeVisible({
+        timeout: 10_000,
+      });
+      await expect(page.getByTestId("workflow-run-stop")).toHaveCount(0);
+    } finally {
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("keeps the latest definition selected and resets shared inputs when switching", async ({
+    page,
+  }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-spec-selection-" });
+    const firstName = uniqueWorkflowName("spec-first");
+    const secondName = uniqueWorkflowName("spec-second");
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      const firstSpec = buildSingleTurnWorkflow({ name: firstName, delayMs: 0 });
+      const secondSpec = buildSingleTurnWorkflow({ name: secondName, delayMs: 0 });
+      const firstParameters = firstSpec.parameters as Record<string, Record<string, unknown>>;
+      const secondParameters = secondSpec.parameters as Record<string, Record<string, unknown>>;
+      firstParameters.shared = {
+        type: "string",
+        default: "first default",
+      };
+      secondParameters.shared = {
+        type: "string",
+        default: "second default",
+      };
+      await saveWorkflow(workspace.client, firstSpec);
+      await saveWorkflow(workspace.client, secondSpec);
+      gate = await delayWorkflowResponse(
+        page,
+        (message) => workflowSpecGetResponseId(message) === firstName,
+      );
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByTestId(`workflow-spec-${firstName}`)).toBeVisible({
+        timeout: 30_000,
+      });
+      await page.getByTestId(`workflow-spec-${firstName}`).click();
+      await gate.waitForDelayedResponse();
+      await page.getByTestId(`workflow-spec-${secondName}`).click();
+      await expect(page.getByTestId("workflow-launch-form")).toContainText(`Launch ${secondName}`);
+
+      gate.release();
+      await flushBrowserFrames(page);
+      await expect(page.getByTestId("workflow-launch-form")).toContainText(`Launch ${secondName}`);
+      await expect(page.getByTestId("workflow-launch-form")).not.toContainText(
+        `Launch ${firstName}`,
+      );
+
+      await page.getByTestId(`workflow-spec-${firstName}`).click();
+      const sharedInput = page.getByTestId("workflow-param-shared").getByRole("textbox");
+      await expect(sharedInput).toHaveValue("first default");
+      await sharedInput.fill("typed for first workflow");
+      await page.getByTestId(`workflow-spec-${secondName}`).click();
+      await expect(page.getByTestId("workflow-launch-form")).toContainText(`Launch ${secondName}`);
+      await expect(sharedInput).toHaveValue("second default");
+
+      secondParameters.shared.default = "replacement default";
+      await page.getByTestId("workflows-new-json").click();
+      await page.getByLabel("Workflow JSON").fill(JSON.stringify(secondSpec));
+      await page.getByTestId("workflow-json-save").click();
+      await expect(page.getByTestId("workflows-action-success")).toContainText(
+        `Saved ${secondName}`,
+      );
+      await expect(page.getByTestId("workflow-launch-form")).toHaveCount(0);
+
+      await page.getByTestId(`workflow-spec-${secondName}`).click();
+      await expect(sharedInput).toHaveValue("replacement default");
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("locks the JSON editor while a definition save is pending", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-save-lock-" });
+    const name = uniqueWorkflowName("save-lock");
+    let saveResponses = 0;
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      gate = await delayWorkflowResponse(page, isWorkflowSpecSaveResponse, {
+        onServerMessage: (message) => {
+          if (isWorkflowSpecSaveResponse(message)) saveResponses += 1;
+        },
+      });
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByTestId("workflows-new-json")).toBeVisible({
+        timeout: 30_000,
+      });
+      await page.getByTestId("workflows-new-json").click();
+      const editor = page.getByLabel("Workflow JSON");
+      const save = page.getByTestId("workflow-json-save");
+      await editor.fill(JSON.stringify(buildSingleTurnWorkflow({ name, delayMs: 0 })));
+      await save.evaluate((element) => {
+        const button = element as HTMLButtonElement;
+        button.click();
+        button.click();
+      });
+      await gate.waitForDelayedResponse();
+
+      await expect(editor).not.toBeEditable();
+      await expect(page.getByTestId("workflow-import-file")).toBeDisabled();
+      await expect(page.getByTestId("workflow-json-validate")).toBeDisabled();
+      await expect(save).toBeDisabled();
+      await save.dispatchEvent("click");
+      await flushBrowserFrames(page);
+      expect(saveResponses).toBe(1);
+
+      gate.release();
+      await expect(page.getByTestId("workflows-action-success")).toContainText(`Saved ${name}`);
+      await expect(page.getByTestId(`workflow-spec-${name}`)).toBeVisible();
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("locks the JSON editor while definition validation is pending", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-validation-lock-" });
+    const name = uniqueWorkflowName("validation-lock");
+    let validateRequests = 0;
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      gate = await delayWorkflowResponse(page, isWorkflowSpecValidateResponse, {
+        onClientMessage: (message) => {
+          if (isWorkflowSpecValidateRequest(message)) validateRequests += 1;
+        },
+      });
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByTestId("workflows-new-json")).toBeVisible({
+        timeout: 30_000,
+      });
+      await page.getByTestId("workflows-new-json").click();
+      const editor = page.getByLabel("Workflow JSON");
+      const validate = page.getByTestId("workflow-json-validate");
+      const save = page.getByTestId("workflow-json-save");
+      await editor.fill(JSON.stringify(buildSingleTurnWorkflow({ name, delayMs: 0 })));
+      await validate.evaluate((element) => {
+        const button = element as HTMLButtonElement;
+        button.click();
+        button.click();
+      });
+      await gate.waitForDelayedResponse();
+
+      await expect(editor).not.toBeEditable();
+      await expect(page.getByTestId("workflow-import-file")).toBeDisabled();
+      await expect(validate).toBeDisabled();
+      await expect(save).toBeDisabled();
+      await validate.dispatchEvent("click");
+      await flushBrowserFrames(page);
+      expect(validateRequests).toBe(1);
+
+      gate.release();
+      await expect(page.getByTestId("workflows-action-success")).toContainText(
+        "Workflow JSON is valid.",
+      );
+      await expect(editor).toBeEditable();
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("submits one workflow run for a rapid double launch", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-launch-lock-" });
+    const name = uniqueWorkflowName("launch-lock");
+    let startResponses = 0;
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 0 }));
+      gate = await delayWorkflowResponse(page, isWorkflowRunStartResponse, {
+        onServerMessage: (message) => {
+          if (isWorkflowRunStartResponse(message)) startResponses += 1;
+        },
+      });
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByTestId(`workflow-spec-${name}`)).toBeVisible({
+        timeout: 30_000,
+      });
+      await page.getByTestId(`workflow-spec-${name}`).click();
+      const launch = page.getByTestId("workflow-launch-submit");
+      await expect(launch).toBeEnabled();
+      await launch.evaluate((element) => {
+        const button = element as HTMLButtonElement;
+        button.click();
+        button.click();
+      });
+      await gate.waitForDelayedResponse();
+
+      await expect(launch).toBeDisabled();
+      expect(startResponses).toBe(1);
+      gate.release();
+      await expect(page.getByTestId("workflows-action-success")).toContainText("Queued wfr_");
+      const runId = await findRunId(workspace.client, name);
+      await expect(waitForWorkflow(workspace.client, runId, ["complete"])).resolves.toMatchObject({
+        run: { id: runId },
+      });
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("submits one run mutation for a rapid double resume", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-resume-lock-" });
+    const name = uniqueWorkflowName("resume-lock");
+    let resumeResponses = 0;
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildTwoTurnWorkflow({ name, delayMs: 3_000 }));
+      const runId = await startWorkflow(workspace.client, {
+        workflowId: name,
+        workspaceId: workspace.workspaceId,
+      });
+      await waitForActiveTurn(workspace.client, runId);
+      const stop = await workspace.client.workflowRunStop(runId);
+      expect(stop.error).toBeNull();
+      await waitForWorkflow(workspace.client, runId, ["stopped"], 30_000);
+
+      gate = await delayWorkflowResponse(page, isWorkflowRunResumeResponse, {
+        onServerMessage: (message) => {
+          if (isWorkflowRunResumeResponse(message)) resumeResponses += 1;
+        },
+      });
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await page.getByTestId(`workflow-run-${runId}`).click();
+      const resume = page.getByTestId("workflow-run-resume");
+      await expect(resume).toBeEnabled();
+      await resume.evaluate((element) => {
+        const button = element as HTMLButtonElement;
+        button.click();
+        button.click();
+      });
+      await gate.waitForDelayedResponse();
+      await page.waitForTimeout(250);
+
+      expect(resumeResponses).toBe(1);
+      await expect(resume).toBeDisabled();
+      gate.release();
+      await expect(page.getByTestId("workflows-action-success")).toContainText("Workflow resumed");
+      await expect(
+        waitForWorkflow(workspace.client, runId, ["complete"], 30_000),
+      ).resolves.toMatchObject({
+        run: { id: runId },
+      });
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("runs persistent goal, reviewed correction, and ordered bounded fan-out", async ({
+    page,
+  }, testInfo) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-demos-" });
+    try {
+      await enablePaseoTools(workspace.client);
+      const goalRunId = await startWorkflow(workspace.client, {
+        workflowId: "goal",
+        workspaceId: workspace.workspaceId,
+        parameters: {
+          workerProvider: "mock",
+          workerModel: "ten-second-stream",
+          workerMode: "load-test",
+          workerThinking: "low",
+          objective: goalDemoObjective(),
+          maxIterations: 4,
+          maxRuntime: "5m",
+        },
+      });
+      const goal = await waitForWorkflow(workspace.client, goalRunId, ["complete"]);
+      expect(goal.run.iteration).toBe(2);
+      expect(acceptedEvents(goal)).toEqual(["continue", "complete"]);
+      expect(goal.run.agentIds).toHaveLength(1);
+
+      const reviewedRunId = await startWorkflow(workspace.client, {
+        workflowId: "reviewed-goal",
+        workspaceId: workspace.workspaceId,
+        parameters: {
+          repoCwd: workspace.repoPath,
+          baseBranch: "main",
+          workerProvider: "mock",
+          workerModel: "ten-second-stream",
+          workerMode: "load-test",
+          workerThinking: "low",
+          reviewerProvider: "mock",
+          reviewerModel: "ten-second-stream",
+          reviewerMode: "load-test",
+          reviewerThinking: "low",
+          objective: reviewedGoalDemoObjective(),
+          reviewerDirective: "Require one explicit correction before accepting the final result.",
+          maxRuntime: "5m",
+        },
+      });
+      const reviewed = await waitForWorkflow(workspace.client, reviewedRunId, ["complete"], 60_000);
+      expect(acceptedEvents(reviewed)).toEqual([
+        "review",
+        "continue",
+        "review",
+        "ready_to_finalize",
+        "review",
+        "revise",
+        "review",
+        "complete",
+      ]);
+      expect(reviewed.run.agentIds).toHaveLength(2);
+
+      const fanoutName = uniqueWorkflowName("fanout");
+      await saveWorkflow(workspace.client, buildFanoutWorkflow(fanoutName));
+      const fanoutRunId = await startWorkflow(workspace.client, {
+        workflowId: fanoutName,
+        workspaceId: workspace.workspaceId,
+      });
+      const fanout = await waitForWorkflow(workspace.client, fanoutRunId, ["complete"], 60_000);
+      expect(fanout.run.workspaceIds.length).toBeGreaterThanOrEqual(3);
+      expect(fanout.run.agentIds).toHaveLength(3);
+      expect(fanout.state.result).toEqual([
+        expect.objectContaining({ index: 0, output: "first" }),
+        expect.objectContaining({ index: 1, output: "second" }),
+        expect.objectContaining({ index: 2, output: "third" }),
+      ]);
+      expect(fanout.events.find((event) => event.type === "map_started")?.details).toMatchObject({
+        size: 3,
+        concurrency: 2,
+      });
+
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      for (const runId of [goalRunId, reviewedRunId, fanoutRunId]) {
+        await expect(page.getByTestId(`workflow-run-${runId}`)).toContainText("complete", {
+          timeout: 30_000,
+        });
+      }
+      await page.getByTestId(`workflow-run-${fanoutRunId}`).click();
+      await expect(page.getByTestId(`workflow-run-${fanoutRunId}`)).toContainText(
+        /[3-9] workspaces/,
+      );
+      await captureEvidence(page, testInfo, "workflows-browser-required-demos");
+    } finally {
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("gracefully stops without launching the next turn, then resumes it", async ({
+    page,
+  }, testInfo) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-stop-resume-" });
+    const name = uniqueWorkflowName("stop-resume");
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildTwoTurnWorkflow({ name, delayMs: 8_000 }));
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByText("Workflows", { exact: true }).last()).toBeVisible({
+        timeout: 30_000,
+      });
+      const runId = await startWorkflow(workspace.client, {
+        workflowId: name,
+        workspaceId: workspace.workspaceId,
+      });
+      await waitForWorkflow(workspace.client, runId, ["running"]);
+      await page.getByTestId("workflows-refresh").click();
+      await page.getByTestId(`workflow-run-${runId}`).click();
+      await expect(page.getByTestId("workflow-run-stop")).toBeVisible({ timeout: 30_000 });
+      await page.getByTestId("workflow-run-stop").click();
+      await expect(page.getByTestId("workflows-action-success")).toContainText("Stop requested");
+
+      const stopped = await waitForWorkflow(workspace.client, runId, ["stopped"], 30_000);
+      expect(stopped.run.iteration).toBe(1);
+      expect(stopped.events.filter((event) => event.type === "turn_started")).toHaveLength(1);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const stillStopped = await inspectRequired(workspace.client, runId);
+      expect(stillStopped.run.status).toBe("stopped");
+      expect(stillStopped.run.iteration).toBe(1);
+
+      await page.getByTestId("workflows-refresh").click();
+      await page.getByTestId(`workflow-run-${runId}`).click();
+      await expect(page.getByTestId("workflow-run-resume")).toBeVisible();
+      await captureEvidence(page, testInfo, "workflows-browser-stopped");
+      await page.getByTestId("workflow-run-resume").click();
+      await expect(page.getByTestId("workflows-action-success")).toContainText("Workflow resumed");
+
+      const complete = await waitForWorkflow(workspace.client, runId, ["complete"], 30_000);
+      expect(complete.run.iteration).toBe(2);
+      expect(acceptedEvents(complete)).toEqual(["next", "done"]);
+      await page.getByTestId("workflows-refresh").click();
+      await page.getByTestId(`workflow-run-${runId}`).click();
+      await expect(page.getByTestId("workflow-run-details")).toContainText("complete");
+    } finally {
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("reconnects after isolated daemon restart and reconciles one native turn once", async ({
+    page,
+  }, testInfo) => {
+    const serverId = `workflow-restart-${Date.now().toString(36)}`;
+    const label = "Workflow Restart Host";
+    let daemon: IsolatedHostDaemon | null = null;
+    let client: SeedDaemonClient | null = null;
+    const repo = await createTempGitRepo("workflow-restart-");
+    let projectId: string | null = null;
+    try {
+      daemon = await startIsolatedHostDaemon(serverId);
+      client = await connectSeedClient({ port: daemon.port });
+      await enablePaseoTools(client);
+      const created = await client.createWorkspace({
+        source: { kind: "directory", path: repo.path },
+        title: "Workflow restart fixture",
+      });
+      if (!created.workspace) throw new Error(created.error ?? "Failed to create workspace");
+      const workspaceId = created.workspace.id;
+      projectId = created.workspace.projectId;
+
+      const name = uniqueWorkflowName("restart");
+      await saveWorkflow(client, buildSingleTurnWorkflow({ name, delayMs: 4_000 }));
+      const sockets = trackWebSockets(page, daemon.port);
+      await gotoAppShell(page);
+      await addConnectedHostAndReload(page, {
+        serverId,
+        label,
+        port: daemon.port,
+      });
+      await waitForConnectedHost(page, {
+        serverId,
+        endpoint: `localhost:${daemon.port}`,
+      });
+      await page.getByTestId("sidebar-workflows").click();
+      await page.getByTestId("workflows-host-filter").click();
+      await page.getByText(label, { exact: true }).last().click();
+      await expect(page.getByText("Workflows", { exact: true }).last()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      const runId = await startWorkflow(client, { workflowId: name, workspaceId });
+      const active = await waitForActiveTurn(client, runId);
+      expect(active.run.activeTurns).toBe(1);
+      await page.getByTestId("workflows-refresh").click();
+      await expect(page.getByTestId(`workflow-run-${runId}`)).toBeVisible({ timeout: 30_000 });
+
+      await daemon.restart();
+      await expect.poll(() => sockets.closes, { timeout: 20_000 }).toBeGreaterThanOrEqual(1);
+      await client.close().catch(() => undefined);
+      client = await connectSeedClient({ port: daemon.port });
+
+      const complete = await waitForWorkflow(client, runId, ["complete"], 30_000);
+      expect(
+        complete.run.iteration,
+        JSON.stringify({ run: complete.run, events: complete.events }, null, 2),
+      ).toBe(1);
+      expect(acceptedEvents(complete)).toEqual(["done"]);
+      const completedTurns = workflowCompletedTurns(complete);
+      expect(completedTurns).toHaveLength(1);
+      expect(new Set(completedTurns.map((turn) => turn.workflowTurnId)).size).toBe(1);
+      const startedTurns = complete.events.filter((event) => event.type === "turn_started");
+      expect(startedTurns).toHaveLength(1);
+      expect(completedTurns[0]?.nativeTurnId).toBe(startedTurns[0]?.details?.nativeTurnId);
+
+      const agentId = complete.run.agentIds[0];
+      const timelineClient = client as SeedDaemonClient & WorkflowTimelineClient;
+      const timeline = await timelineClient.fetchAgentTimeline(agentId, {
+        direction: "tail",
+        projection: "canonical",
+        limit: 100,
+      });
+      const workflowMessages = timeline.entries
+        .map((entry) => entry.item)
+        .filter(
+          (item): item is typeof item & { clientMessageId: string } =>
+            item.type === "user_message" && typeof item.clientMessageId === "string",
+        );
+      expect(workflowMessages).toHaveLength(1);
+      expect(new Set(workflowMessages.map((item) => item.clientMessageId)).size).toBe(1);
+
+      await expect.poll(() => sockets.opens, { timeout: 30_000 }).toBeGreaterThanOrEqual(2);
+      await expect(page.getByTestId(`workflow-run-${runId}`)).toContainText("complete", {
+        timeout: 30_000,
+      });
+      await expect(page.getByTestId("workflows-load-error")).toHaveCount(0);
+      await captureEvidence(page, testInfo, "workflows-browser-reconnected");
+    } finally {
+      await page.goto("about:blank").catch(() => undefined);
+      if (client && projectId) {
+        await client.removeProject(projectId).catch(() => undefined);
+      }
+      await client?.close().catch(() => undefined);
+      await daemon?.close();
+      await repo.cleanup();
+    }
+  });
+});
+
+function uniqueWorkflowName(prefix: string): string {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function findRunId(client: SeedDaemonClient, workflowId: string): Promise<string> {
+  await expect
+    .poll(
+      async () => {
+        const payload = await client.workflowRunList();
+        if (payload.error) throw new Error(payload.error);
+        return payload.runs.find((run) => run.workflowId === workflowId)?.id ?? null;
+      },
+      { timeout: 10_000 },
+    )
+    .not.toBeNull();
+  const payload = await client.workflowRunList();
+  const run = payload.runs.find((candidate) => candidate.workflowId === workflowId);
+  if (!run) throw new Error(`Workflow run not found for ${workflowId}`);
+  return run.id;
+}
+
+async function inspectRequired(
+  client: SeedDaemonClient,
+  runId: string,
+): Promise<WorkflowRunDetails> {
+  const payload = await client.workflowRunInspect(runId);
+  if (payload.error || !payload.details) {
+    throw new Error(payload.error ?? `Workflow run not found: ${runId}`);
+  }
+  return payload.details;
+}
+
+async function waitForActiveTurn(
+  client: SeedDaemonClient,
+  runId: string,
+): Promise<WorkflowRunDetails> {
+  await expect
+    .poll(
+      async () => {
+        const details = await inspectRequired(client, runId);
+        return details.run.activeTurns;
+      },
+      { timeout: 30_000 },
+    )
+    .toBe(1);
+  return inspectRequired(client, runId);
+}
+
+function acceptedEvents(details: WorkflowRunDetails): string[] {
+  return details.events.flatMap((event) =>
+    event.type === "event_accepted" && event.event ? [event.event] : [],
+  );
+}
+
+async function enablePaseoTools(client: SeedDaemonClient): Promise<void> {
+  await client.patchDaemonConfig({ mcp: { injectIntoAgents: true } });
+}
+
+function workflowCompletedTurns(
+  details: WorkflowRunDetails,
+): Array<{ workflowTurnId: string; clientMessageId: string; nativeTurnId: string | null }> {
+  const instances = (details.state.instances ?? {}) as Record<
+    string,
+    { agents?: Record<string, { turns?: Array<Record<string, unknown>> }> }
+  >;
+  return Object.values(instances).flatMap((instance) =>
+    Object.values(instance.agents ?? {}).flatMap((agent) =>
+      (agent.turns ?? []).flatMap((turn) =>
+        typeof turn.workflowTurnId === "string" && typeof turn.clientMessageId === "string"
+          ? [
+              {
+                workflowTurnId: turn.workflowTurnId,
+                clientMessageId: turn.clientMessageId,
+                nativeTurnId: typeof turn.nativeTurnId === "string" ? turn.nativeTurnId : null,
+              },
+            ]
+          : [],
+      ),
+    ),
+  );
+}
+
+async function captureEvidence(page: Page, testInfo: TestInfo, name: string): Promise<void> {
+  const screenshot = await page.screenshot({ fullPage: true });
+  await testInfo.attach(name, { body: screenshot, contentType: "image/png" });
+  const qaDirectory = process.env.PASEO_WORKFLOW_QA_DIR;
+  if (!qaDirectory) return;
+  await mkdir(qaDirectory, { recursive: true });
+  await writeFile(path.join(qaDirectory, `${name}.png`), screenshot);
+}
+
+function trackWebSockets(page: Page, port: number): { opens: number; closes: number } {
+  const counts = { opens: 0, closes: 0 };
+  page.on("websocket", (socket) => {
+    if (!socket.url().includes(`:${port}`)) return;
+    counts.opens += 1;
+    socket.on("close", () => {
+      counts.closes += 1;
+    });
+  });
+  return counts;
+}
+
+interface WorkflowTimelineClient {
+  fetchAgentTimeline(
+    agentId: string,
+    options: { direction: "tail"; projection: "canonical"; limit: number },
+  ): Promise<{
+    entries: Array<{
+      item: {
+        type: string;
+        clientMessageId?: string;
+        [key: string]: unknown;
+      };
+    }>;
+  }>;
+}
+
+interface WorkflowResponseGate {
+  release(): void;
+  waitForDelayedResponse(): Promise<void>;
+}
+
+async function delayWorkflowResponse(
+  page: Page,
+  shouldDelay: (message: string | Buffer) => boolean,
+  options: {
+    skip?: number;
+    onClientMessage?: (message: string | Buffer) => void;
+    onServerMessage?: (message: string | Buffer) => void;
+  } = {},
+): Promise<WorkflowResponseGate> {
+  let releaseRequested = false;
+  let delayedResponseSeen = false;
+  let skippedResponses = 0;
+  const delayedForwards: Array<() => void> = [];
+  let resolveDelayedResponse!: () => void;
+  const delayedResponse = new Promise<void>((resolve) => {
+    resolveDelayedResponse = resolve;
+  });
+
+  await page.routeWebSocket(daemonWsRoutePattern(), (ws) => {
+    const server = ws.connectToServer();
+    ws.onMessage((message) => {
+      options.onClientMessage?.(message);
+      server.send(message);
+    });
+    server.onMessage((message) => {
+      options.onServerMessage?.(message);
+      if (!delayedResponseSeen && shouldDelay(message)) {
+        if (skippedResponses < (options.skip ?? 0)) {
+          skippedResponses += 1;
+          ws.send(message);
+          return;
+        }
+        delayedResponseSeen = true;
+        resolveDelayedResponse();
+        if (releaseRequested) {
+          ws.send(message);
+          return;
+        }
+        delayedForwards.push(() => ws.send(message));
+        return;
+      }
+      ws.send(message);
+    });
+  });
+
+  return {
+    release() {
+      releaseRequested = true;
+      for (const forward of delayedForwards.splice(0)) forward();
+    },
+    waitForDelayedResponse: () => delayedResponse,
+  };
+}
+
+function isWorkflowRunListRequest(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return envelope.type === "session" && envelope.message?.type === "workflow.run.list.request";
+  } catch {
+    return false;
+  }
+}
+
+function isWorkflowRunListResponse(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return envelope.type === "session" && envelope.message?.type === "workflow.run.list.response";
+  } catch {
+    return false;
+  }
+}
+
+function isWorkflowSpecSaveResponse(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return envelope.type === "session" && envelope.message?.type === "workflow.spec.save.response";
+  } catch {
+    return false;
+  }
+}
+
+function isWorkflowSpecValidateRequest(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return (
+      envelope.type === "session" && envelope.message?.type === "workflow.spec.validate.request"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isWorkflowSpecValidateResponse(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return (
+      envelope.type === "session" && envelope.message?.type === "workflow.spec.validate.response"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isWorkflowRunStartResponse(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return envelope.type === "session" && envelope.message?.type === "workflow.run.start.response";
+  } catch {
+    return false;
+  }
+}
+
+function isWorkflowRunResumeResponse(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return envelope.type === "session" && envelope.message?.type === "workflow.run.resume.response";
+  } catch {
+    return false;
+  }
+}
+
+async function transformWorkflowResponses(
+  page: Page,
+  transform: (message: string | Buffer) => string | Buffer,
+): Promise<void> {
+  await page.routeWebSocket(daemonWsRoutePattern(), (ws) => {
+    const server = ws.connectToServer();
+    ws.onMessage((message) => server.send(message));
+    server.onMessage((message) => ws.send(transform(message)));
+  });
+}
+
+function rewriteRunListTimestamp(
+  message: string | Buffer,
+  runId: string,
+  status: string,
+  updatedAt: string,
+): string | Buffer {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: {
+        type?: unknown;
+        payload?: { runs?: Array<{ id?: unknown; status?: unknown; updatedAt?: unknown }> };
+      };
+    };
+    if (
+      envelope.type !== "session" ||
+      envelope.message?.type !== "workflow.run.list.response" ||
+      !Array.isArray(envelope.message.payload?.runs)
+    ) {
+      return message;
+    }
+    const run = envelope.message.payload.runs.find(
+      (candidate) => candidate.id === runId && candidate.status === status,
+    );
+    if (!run) return message;
+    run.updatedAt = updatedAt;
+    const rewritten = JSON.stringify(envelope);
+    return typeof message === "string" ? rewritten : Buffer.from(rewritten);
+  } catch {
+    return message;
+  }
+}
+
+function workflowSpecGetResponseId(message: string | Buffer): string | null {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: {
+        type?: unknown;
+        payload?: { summary?: { id?: unknown } };
+      };
+    };
+    const id =
+      envelope.type === "session" && envelope.message?.type === "workflow.spec.get.response"
+        ? envelope.message.payload?.summary?.id
+        : null;
+    return typeof id === "string" ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+function workflowInspectResponseRunId(message: string | Buffer): string | null {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: {
+        type?: unknown;
+        payload?: { details?: { run?: { id?: unknown } } };
+      };
+    };
+    const id =
+      envelope.type === "session" && envelope.message?.type === "workflow.run.inspect.response"
+        ? envelope.message.payload?.details?.run?.id
+        : null;
+    return typeof id === "string" ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+async function flushBrowserFrames(page: Page): Promise<void> {
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      }),
+  );
+}

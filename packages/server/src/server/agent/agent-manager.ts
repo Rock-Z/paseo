@@ -37,6 +37,7 @@ import {
   type AgentSessionConfig,
   type AgentStreamEvent,
   type AgentTimelineItem,
+  type AgentTurnReceipt,
   type AgentUsage,
   type AgentRuntimeInfo,
   type ImportedTimelineEntry,
@@ -236,6 +237,7 @@ export interface CreateAgentOptions {
   // undefined is an explicit decision: the agent never appears in the sidebar.
   workspaceId: string | undefined;
   owner?: AgentOwner;
+  recentTurnReceipts?: AgentTurnReceipt[];
 }
 
 export interface AgentManagerOptions {
@@ -291,6 +293,10 @@ function resolveInitialAttention(input: AttentionState | undefined): AttentionSt
   };
 }
 
+function cloneTurnReceipts(receipts: AgentTurnReceipt[] | undefined): AgentTurnReceipt[] {
+  return structuredClone(receipts ?? []);
+}
+
 interface StreamEventFlags {
   shouldDispatchEvent: boolean;
   shouldNotifyWaiters: boolean;
@@ -334,6 +340,7 @@ interface ManagedAgentBase {
   attention: AttentionState;
   foregroundTurnWaiters: Set<ForegroundTurnWaiter>;
   finalizedForegroundTurnIds: Set<string>;
+  recentTurnReceipts: AgentTurnReceipt[];
   unsubscribeSession: (() => void) | null;
   /**
    * Internal agents are hidden from listings and don't trigger notifications.
@@ -443,7 +450,12 @@ function isAgentBusy(status: AgentLifecycleStatus): boolean {
   return BUSY_STATUSES.has(status);
 }
 
-function isTurnTerminalEvent(event: AgentStreamEvent): boolean {
+function isTurnTerminalEvent(
+  event: AgentStreamEvent,
+): event is Extract<
+  AgentStreamEvent,
+  { type: "turn_completed" | "turn_failed" | "turn_canceled" }
+> {
   return (
     event.type === "turn_completed" ||
     event.type === "turn_failed" ||
@@ -751,6 +763,18 @@ export class AgentManager {
     );
   }
 
+  getActiveAutonomousTurnId(agentId: string): string | null {
+    const run = this.runs.getRun(agentId);
+    return run?.kind === "autonomous" ? run.turnId : null;
+  }
+
+  getActiveForegroundClientMessageId(agentId: string): string | null {
+    const agent = this.agents.get(agentId);
+    const run = this.runs.getPendingRun(agentId);
+    if (!agent?.activeForegroundTurnId || run?.turnId !== agent.activeForegroundTurnId) return null;
+    return run.clientMessageId;
+  }
+
   subscribe(callback: AgentSubscriber, options?: SubscribeOptions): () => void {
     const targetAgentId =
       options?.agentId == null ? null : validateAgentId(options.agentId, "subscribe");
@@ -1037,6 +1061,7 @@ export class AgentManager {
       initialTitle: options.initialTitle,
       workspaceId: options.workspaceId,
       owner: options.owner,
+      recentTurnReceipts: options.recentTurnReceipts,
     });
   }
 
@@ -1061,6 +1086,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      recentTurnReceipts?: AgentTurnReceipt[];
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1080,6 +1106,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      recentTurnReceipts?: AgentTurnReceipt[];
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1525,6 +1552,7 @@ export class AgentManager {
         activeForegroundTurnId: null,
         foregroundTurnWaiters: new Set(),
         finalizedForegroundTurnIds: new Set(),
+        recentTurnReceipts: cloneTurnReceipts(record.recentTurnReceipts),
         unsubscribeSession: null,
         persistence: record.persistence ?? null,
         historyPrimed: true,
@@ -1979,7 +2007,7 @@ export class AgentManager {
     const isReplacement = agent.pendingReplacement;
     agent.lastError = undefined;
 
-    const pendingRun = this.runs.createPendingRun(agentId);
+    const pendingRun = this.runs.createPendingRun(agentId, options?.clientMessageId ?? null);
 
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string;
@@ -2676,6 +2704,7 @@ export class AgentManager {
       publishWhenReady?: boolean;
       workspaceId?: string;
       owner?: AgentOwner;
+      recentTurnReceipts?: AgentTurnReceipt[];
     },
   ): Promise<ManagedAgent> {
     let registered = false;
@@ -2815,6 +2844,7 @@ export class AgentManager {
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
           owner?: AgentOwner;
+          recentTurnReceipts?: AgentTurnReceipt[];
         }
       | undefined;
   }): ActiveManagedAgent {
@@ -2841,6 +2871,7 @@ export class AgentManager {
       activeForegroundTurnId: null,
       foregroundTurnWaiters: new Set<ForegroundTurnWaiter>(),
       finalizedForegroundTurnIds: new Set<string>(),
+      recentTurnReceipts: cloneTurnReceipts(options?.recentTurnReceipts),
       unsubscribeSession: null,
       persistence: attachPersistenceCwd(
         options?.persistence ?? session.describePersistence(),
@@ -3016,14 +3047,14 @@ export class AgentManager {
       "agent.manager.dispatch_session_event",
     );
 
-    const shouldNotifyWaiters = await this.handleStreamEvent(agent, event);
+    const handled = await this.handleStreamEvent(agent, event);
 
-    if (!shouldNotifyWaiters) {
+    if (!handled.shouldNotifyWaiters) {
       return;
     }
 
-    this.runs.notifyWaiters(matchingWaiters, event, {
-      terminal: isTurnTerminalEvent(event),
+    this.runs.notifyWaiters(matchingWaiters, handled.event, {
+      terminal: isTurnTerminalEvent(handled.event),
     });
     this.logger.trace(
       {
@@ -3032,8 +3063,8 @@ export class AgentManager {
         sessionId: agent.persistence?.sessionId ?? undefined,
         turnId,
         notifiedWaiterCount: matchingWaiters.length,
-        terminal: isTurnTerminalEvent(event),
-        event,
+        terminal: isTurnTerminalEvent(handled.event),
+        event: handled.event,
       },
       "agent.manager.notify_waiters",
     );
@@ -3295,7 +3326,7 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     event: AgentStreamEvent,
     options?: HandleStreamEventOptions,
-  ): Promise<boolean> {
+  ): Promise<{ event: AgentStreamEvent; shouldNotifyWaiters: boolean }> {
     if (event.type === "timeline") {
       event = {
         ...event,
@@ -3310,7 +3341,7 @@ export class AgentManager {
       isTurnTerminalEvent(event) &&
       this.runs.hasFinalizedTurn(agent, eventTurnId)
     ) {
-      return false;
+      return { event, shouldNotifyWaiters: false };
     }
 
     // Only update timestamp for live events, not history replay
@@ -3318,12 +3349,20 @@ export class AgentManager {
       this.touchUpdatedAt(agent);
       if (this.agentStreamCoalescer.handle(agent.id, event)) {
         this.traceCoalescerBuffered(agent, event, eventTurnId);
-        return false;
+        return { event, shouldNotifyWaiters: false };
       }
       this.agentStreamCoalescer.flushFor(agent.id);
     }
 
     const flags: StreamEventFlags = { shouldDispatchEvent: true, shouldNotifyWaiters: true };
+
+    event = await this.ensureIdentifiedTerminalEventDurable({
+      agent,
+      event,
+      eventTurnId,
+      isForegroundEvent,
+      fromHistory: options?.fromHistory === true,
+    });
 
     const dispatchPromise = this.dispatchStreamEventByType({
       agent,
@@ -3350,7 +3389,77 @@ export class AgentManager {
 
     this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
 
-    return flags.shouldNotifyWaiters;
+    return { event, shouldNotifyWaiters: flags.shouldNotifyWaiters };
+  }
+
+  private async ensureIdentifiedTerminalEventDurable(input: {
+    agent: ActiveManagedAgent;
+    event: AgentStreamEvent;
+    eventTurnId: string | undefined;
+    isForegroundEvent: boolean;
+    fromHistory: boolean;
+  }): Promise<AgentStreamEvent> {
+    try {
+      await this.persistIdentifiedTurnReceipt(input);
+      return input.event;
+    } catch (error) {
+      const message = `Failed to persist terminal turn receipt: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+      this.logger.error(
+        { err: error, agentId: input.agent.id, turnId: input.eventTurnId },
+        "Failed to persist identified terminal turn receipt",
+      );
+      const failureEvent: AgentStreamEvent = {
+        type: "turn_failed",
+        provider: input.event.provider,
+        turnId: input.eventTurnId,
+        error: message,
+        code: "turn_receipt_persistence_failed",
+      };
+      try {
+        await this.persistIdentifiedTurnReceipt({ ...input, event: failureEvent });
+      } catch (failureReceiptError) {
+        this.logger.error(
+          { err: failureReceiptError, agentId: input.agent.id, turnId: input.eventTurnId },
+          "Failed to persist terminal turn failure receipt",
+        );
+      }
+      return failureEvent;
+    }
+  }
+
+  private async persistIdentifiedTurnReceipt(input: {
+    agent: ActiveManagedAgent;
+    event: AgentStreamEvent;
+    eventTurnId: string | undefined;
+    isForegroundEvent: boolean;
+    fromHistory: boolean;
+  }): Promise<void> {
+    const { agent, event, eventTurnId, isForegroundEvent, fromHistory } = input;
+    if (fromHistory || !isForegroundEvent || !eventTurnId || !isTurnTerminalEvent(event)) return;
+    const clientMessageId = this.runs.getPendingRun(agent.id)?.clientMessageId;
+    if (!clientMessageId) return;
+    const statusByEvent = {
+      turn_completed: "completed",
+      turn_failed: "failed",
+      turn_canceled: "canceled",
+    } as const;
+    const receipt: AgentTurnReceipt = {
+      turnId: eventTurnId,
+      clientMessageId,
+      status: statusByEvent[event.type],
+      error: event.type === "turn_failed" ? event.error : null,
+    };
+    agent.recentTurnReceipts = [
+      ...agent.recentTurnReceipts.filter(
+        (candidate) =>
+          candidate.turnId !== receipt.turnId &&
+          candidate.clientMessageId !== receipt.clientMessageId,
+      ),
+      receipt,
+    ].slice(-50);
+    await this.persistSnapshot(agent);
   }
 
   private traceHandleStreamEventStart(

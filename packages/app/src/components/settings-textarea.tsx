@@ -11,6 +11,7 @@ interface SettingsTextAreaProps {
   placeholder?: string;
   testID?: string;
   style?: StyleProp<TextStyle>;
+  editable?: boolean;
 }
 
 export function SettingsTextArea({
@@ -20,6 +21,7 @@ export function SettingsTextArea({
   placeholder,
   testID,
   style,
+  editable = true,
 }: SettingsTextAreaProps) {
   const { theme } = useUnistyles();
   const inputStyle = useMemo(() => [styles.input, style], [style]);
@@ -33,6 +35,7 @@ export function SettingsTextArea({
       onChangeText={onChangeText}
       placeholder={placeholder}
       placeholderTextColor={theme.colors.foregroundMuted}
+      editable={editable}
       style={inputStyle}
     />
   );

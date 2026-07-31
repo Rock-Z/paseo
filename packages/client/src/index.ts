@@ -24,6 +24,15 @@ import type {
   FetchAgentTimelineDirection,
   FetchAgentTimelinePayload,
   FetchAgentTimelineProjection,
+  StartWorkflowOptions,
+  WorkflowRunInspectPayload,
+  WorkflowRunListPayload,
+  WorkflowRunMutationPayload,
+  WorkflowRunStartPayload,
+  WorkflowSpecGetPayload,
+  WorkflowSpecListPayload,
+  WorkflowSpecSavePayload,
+  WorkflowSpecValidatePayload,
 } from "./daemon-client.js";
 
 export { DaemonClient };
@@ -32,6 +41,7 @@ export type {
   DaemonEvent,
   BrowserAutomationExecuteRequestMessage,
   BrowserAutomationExecuteResponseMessage,
+  StartWorkflowOptions,
   WebSocketFactory,
   WebSocketLike,
 } from "./daemon-client.js";
@@ -329,11 +339,27 @@ export interface PaseoConfigActions {
   ): Promise<{ requestId: string; config: MutableDaemonConfig }>;
 }
 
+export interface PaseoWorkflowActions {
+  listSpecs(requestId?: string): Promise<WorkflowSpecListPayload>;
+  getSpec(id: string, requestId?: string): Promise<WorkflowSpecGetPayload>;
+  validateSpec(
+    spec: Record<string, unknown>,
+    requestId?: string,
+  ): Promise<WorkflowSpecValidatePayload>;
+  saveSpec(spec: Record<string, unknown>, requestId?: string): Promise<WorkflowSpecSavePayload>;
+  start(options: StartWorkflowOptions): Promise<WorkflowRunStartPayload>;
+  listRuns(requestId?: string): Promise<WorkflowRunListPayload>;
+  inspect(runId: string, requestId?: string): Promise<WorkflowRunInspectPayload>;
+  stop(runId: string, requestId?: string): Promise<WorkflowRunMutationPayload>;
+  resume(runId: string, requestId?: string): Promise<WorkflowRunMutationPayload>;
+}
+
 export interface PaseoClient {
   readonly workspaces: PaseoWorkspaceActions;
   readonly agents: PaseoAgentActions;
   readonly providers: PaseoProviderActions;
   readonly config: PaseoConfigActions;
+  readonly workflows: PaseoWorkflowActions;
   connect(): Promise<void>;
   close(): Promise<void>;
   ensureConnected(): void;
@@ -397,6 +423,17 @@ export function createPaseoClient(config: PaseoClientConfig): PaseoClient {
     config: {
       get: (requestId) => daemonClient.getDaemonConfig(requestId),
       patch: (patch, requestId) => daemonClient.patchDaemonConfig(patch, requestId),
+    },
+    workflows: {
+      listSpecs: (requestId) => daemonClient.workflowSpecList(requestId),
+      getSpec: (id, requestId) => daemonClient.workflowSpecGet(id, requestId),
+      validateSpec: (spec, requestId) => daemonClient.workflowSpecValidate(spec, requestId),
+      saveSpec: (spec, requestId) => daemonClient.workflowSpecSave(spec, requestId),
+      start: (options) => daemonClient.workflowRunStart(options),
+      listRuns: (requestId) => daemonClient.workflowRunList(requestId),
+      inspect: (runId, requestId) => daemonClient.workflowRunInspect(runId, requestId),
+      stop: (runId, requestId) => daemonClient.workflowRunStop(runId, requestId),
+      resume: (runId, requestId) => daemonClient.workflowRunResume(runId, requestId),
     },
     connect: () => daemonClient.connect(),
     close: () => daemonClient.close(),

@@ -1935,6 +1935,75 @@ test("createAgent passes native Paseo tools through launch context without inter
   });
 });
 
+test("createAgent omits native Paseo tools when operator tools are disabled", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const tools = new Map([
+    [
+      "emit_event",
+      {
+        name: "emit_event",
+        description: "Emit a workflow event",
+        handler: async () => ({ content: [] }),
+      },
+    ],
+    [
+      "list_agents",
+      {
+        name: "list_agents",
+        description: "List agents",
+        handler: async () => ({ content: [] }),
+      },
+    ],
+  ]);
+  const paseoTools: PaseoToolCatalog = {
+    tools,
+    getTool: (name) => tools.get(name),
+    executeTool: async (name, input, context) => {
+      const tool = tools.get(name);
+      if (!tool) throw new Error(`Paseo tool not found: ${name}`);
+      return tool.handler(input, context ?? {});
+    },
+  };
+  const paseoToolCatalogFactory = vi.fn(() => paseoTools);
+
+  class NativeToolsClient extends TestAgentClient {
+    override readonly capabilities = {
+      ...TEST_CAPABILITIES,
+      supportsNativePaseoTools: true,
+    };
+    lastLaunchContext: AgentLaunchContext | undefined;
+
+    override async createSession(
+      config: AgentSessionConfig,
+      launchContext?: AgentLaunchContext,
+    ): Promise<AgentSession> {
+      this.lastLaunchContext = launchContext;
+      return new TestAgentSession(config);
+    }
+  }
+
+  const client = new NativeToolsClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    paseoToolsEnabled: false,
+    paseoToolCatalogFactory,
+    idFactory: () => "00000000-0000-4000-8000-000000000107",
+  });
+
+  await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+
+  expect(client.lastLaunchContext?.paseoTools).toBeUndefined();
+  expect(paseoToolCatalogFactory).not.toHaveBeenCalled();
+
+  rmSync(workdir, { recursive: true, force: true });
+});
+
 test("createAgent injects the MCP auth token as a bearer header into the launch config", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");
@@ -4825,11 +4894,14 @@ test("applies live autonomous events and preserves usage omitted from completion
 
   // Push autonomous events through the session's subscribe() callbacks
   const autonomousTurnId = "autonomous-turn-1";
+  const running = waitForAgentLifecycle(manager, snapshot.id, "running");
   capturedSession!.pushEvent({
     type: "turn_started",
     provider: "codex",
     turnId: autonomousTurnId,
   });
+  await running;
+  expect(manager.getActiveAutonomousTurnId(snapshot.id)).toBe(autonomousTurnId);
   capturedSession!.pushEvent({
     type: "usage_updated",
     provider: "codex",
@@ -4854,6 +4926,7 @@ test("applies live autonomous events and preserves usage omitted from completion
   await settled;
 
   const updated = manager.getAgent(snapshot.id);
+  expect(manager.getActiveAutonomousTurnId(snapshot.id)).toBeNull();
   expect(updated?.lifecycle).toBe("idle");
   expect(updated?.lastUsage).toEqual({
     inputTokens: 10,
@@ -8022,6 +8095,253 @@ test("authoritative timeline includes provider-emitted submitted user prompt", a
       text: "hello from composer",
       messageId: "provider-message-1",
       clientMessageId: "msg-client-1",
+    });
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a canceled identified turn is durable before runAgent resolves and survives reload", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-receipt-"));
+  const storagePath = join(workdir, "agents");
+  const receiptPersistStarted = deferred<void>();
+  const allowReceiptPersist = deferred<void>();
+
+  class BlockingReceiptStorage extends AgentStorage {
+    override async applySnapshot(
+      agent: ManagedAgent,
+      options?: { title?: string | null; internal?: boolean },
+    ): Promise<void> {
+      const receipts = (
+        agent as ManagedAgent & {
+          recentTurnReceipts?: Array<{ clientMessageId: string; status: string }>;
+        }
+      ).recentTurnReceipts;
+      if (
+        receipts?.some(
+          (receipt) =>
+            receipt.clientMessageId === "workflow-client-message" && receipt.status === "canceled",
+        )
+      ) {
+        receiptPersistStarted.resolve();
+        await allowReceiptPersist.promise;
+      }
+      await super.applySnapshot(agent, options);
+    }
+  }
+
+  class CanceledTurnSession extends TestAgentSession {
+    override async startTurn(
+      prompt: AgentPromptInput,
+      options?: AgentRunOptions,
+    ): Promise<{ turnId: string }> {
+      const turnId = "turn-canceled-workflow";
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: {
+            type: "user_message",
+            text: typeof prompt === "string" ? prompt : "",
+            clientMessageId: options?.clientMessageId,
+          },
+        });
+        this.pushEvent({
+          type: "turn_canceled",
+          provider: this.provider,
+          turnId,
+          reason: "interrupted",
+        });
+      }, 0);
+      return { turnId };
+    }
+  }
+
+  class CanceledTurnClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new CanceledTurnSession(config);
+    }
+  }
+
+  const storage = new BlockingReceiptStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: { codex: new CanceledTurnClient() },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000403",
+  });
+
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    let resultSettled = false;
+    const result = manager
+      .runAgent(snapshot.id, "cancel this workflow turn", {
+        clientMessageId: "workflow-client-message",
+      })
+      .finally(() => {
+        resultSettled = true;
+      });
+
+    await Promise.race([
+      receiptPersistStarted.promise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("terminal receipt persistence did not start")), 1_000),
+      ),
+    ]);
+    expect(resultSettled).toBe(false);
+    allowReceiptPersist.resolve();
+    await expect(result).resolves.toMatchObject({ canceled: true });
+
+    const stored = (await storage.get(snapshot.id)) as StoredAgentRecord & {
+      recentTurnReceipts?: Array<Record<string, unknown>>;
+    };
+    expect(stored.recentTurnReceipts).toContainEqual({
+      turnId: "turn-canceled-workflow",
+      clientMessageId: "workflow-client-message",
+      status: "canceled",
+      error: null,
+    });
+
+    const reloadedManager = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: storage,
+      logger,
+    });
+    const reloaded = await ensureAgentLoaded(snapshot.id, {
+      agentManager: reloadedManager,
+      agentStorage: storage,
+      logger,
+    });
+    expect(
+      (
+        reloaded as ManagedAgent & {
+          recentTurnReceipts?: Array<Record<string, unknown>>;
+        }
+      ).recentTurnReceipts,
+    ).toContainEqual({
+      turnId: "turn-canceled-workflow",
+      clientMessageId: "workflow-client-message",
+      status: "canceled",
+      error: null,
+    });
+  } finally {
+    allowReceiptPersist.resolve();
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a terminal receipt write failure settles the native turn as a durable failure", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-receipt-failure-"));
+  const storagePath = join(workdir, "agents");
+
+  class FailFirstTerminalReceiptStorage extends AgentStorage {
+    private failed = false;
+
+    override async applySnapshot(
+      agent: ManagedAgent,
+      options?: { title?: string | null; internal?: boolean },
+    ): Promise<void> {
+      const receipts = (
+        agent as ManagedAgent & {
+          recentTurnReceipts?: Array<{ clientMessageId: string; status: string }>;
+        }
+      ).recentTurnReceipts;
+      if (
+        !this.failed &&
+        receipts?.some(
+          (receipt) =>
+            receipt.clientMessageId === "workflow-client-message" && receipt.status === "completed",
+        )
+      ) {
+        this.failed = true;
+        throw new Error("injected terminal receipt write failure");
+      }
+      await super.applySnapshot(agent, options);
+    }
+  }
+
+  class CompletedTurnSession extends TestAgentSession {
+    override async startTurn(
+      prompt: AgentPromptInput,
+      options?: AgentRunOptions,
+    ): Promise<{ turnId: string }> {
+      const turnId = "turn-completed-with-receipt-failure";
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: {
+            type: "user_message",
+            text: typeof prompt === "string" ? prompt : "",
+            clientMessageId: options?.clientMessageId,
+          },
+        });
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      }, 0);
+      return { turnId };
+    }
+  }
+
+  class CompletedTurnClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new CompletedTurnSession(config);
+    }
+  }
+
+  const storage = new FailFirstTerminalReceiptStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: { codex: new CompletedTurnClient() },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000404",
+  });
+
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const result = manager.runAgent(snapshot.id, "complete this workflow turn", {
+      clientMessageId: "workflow-client-message",
+    });
+    const outcome = await Promise.race([
+      result.then(
+        () => ({ kind: "resolved" as const }),
+        (error: unknown) => ({
+          kind: "rejected" as const,
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      ),
+      new Promise<{ kind: "timeout" }>((resolve) =>
+        setTimeout(() => resolve({ kind: "timeout" }), 1_000),
+      ),
+    ]);
+
+    expect(outcome).toMatchObject({
+      kind: "rejected",
+      message: expect.stringContaining("injected terminal receipt write failure"),
+    });
+    expect(manager.getAgent(snapshot.id)).toMatchObject({
+      lifecycle: "error",
+      activeForegroundTurnId: null,
+    });
+    const stored = (await storage.get(snapshot.id)) as StoredAgentRecord & {
+      recentTurnReceipts?: Array<Record<string, unknown>>;
+    };
+    expect(stored.recentTurnReceipts).toContainEqual({
+      turnId: "turn-completed-with-receipt-failure",
+      clientMessageId: "workflow-client-message",
+      status: "failed",
+      error: expect.stringContaining("injected terminal receipt write failure"),
     });
   } finally {
     await manager.flush().catch(() => undefined);

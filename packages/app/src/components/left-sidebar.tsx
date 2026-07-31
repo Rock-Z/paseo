@@ -8,6 +8,7 @@ import {
   Search,
   Server,
   Settings,
+  Workflow,
   X,
 } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
@@ -34,6 +35,7 @@ import { SidebarResizeHandle } from "@/components/sidebar-resize-handle";
 import { Shortcut } from "@/components/ui/shortcut";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { HEADER_INNER_HEIGHT, useIsCompactFormFactor } from "@/constants/layout";
+import { isWeb } from "@/constants/platform";
 import { useOpenAddProject } from "@/hooks/use-open-add-project";
 import { useShortcutKeys } from "@/hooks/use-shortcut-keys";
 import { canCreateWorktreeForProjectKind } from "@/projects/host-projects";
@@ -63,11 +65,13 @@ import {
   buildSettingsAddHostRoute,
   buildSettingsHostSectionRoute,
   buildSettingsRoute,
+  buildWorkflowsRoute,
 } from "@/utils/host-routes";
 import type { ShortcutKey } from "@/utils/format-shortcut";
 import { SidebarAgentListSkeleton } from "./sidebar-agent-list-skeleton";
 import { SidebarCalloutSlot } from "./sidebar-callout-slot";
 import { SidebarWorkspaceList } from "./sidebar-workspace-list";
+import { useSessionStore } from "@/stores/session-store";
 
 type SidebarTheme = ReturnType<typeof useUnistyles>["theme"];
 
@@ -120,6 +124,7 @@ interface DesktopSidebarProps extends SidebarSharedProps {
   active: boolean;
   handleViewMore: () => void;
   handleViewSchedules: () => void;
+  handleViewWorkflows: () => void;
 }
 
 export const LeftSidebar = memo(function LeftSidebar({ active }: { active: boolean }) {
@@ -128,6 +133,12 @@ export const LeftSidebar = memo(function LeftSidebar({ active }: { active: boole
   const insets = useSafeAreaInsets();
   const isCompactLayout = useIsCompactFormFactor();
   const showMobileAgent = usePanelStore((state) => state.showMobileAgent);
+  const activeWorkspaceSelection = useActiveWorkspaceSelection();
+  const focusedAgentId = useSessionStore((state) =>
+    activeWorkspaceSelection
+      ? (state.sessions[activeWorkspaceSelection.serverId]?.focusedAgentId ?? null)
+      : null,
+  );
 
   const {
     projects,
@@ -216,6 +227,16 @@ export const LeftSidebar = memo(function LeftSidebar({ active }: { active: boole
     router.push(buildSchedulesRoute());
   }, []);
 
+  const handleViewWorkflowsNavigate = useCallback(() => {
+    router.push(
+      buildWorkflowsRoute({
+        serverId: activeWorkspaceSelection?.serverId,
+        workspaceId: activeWorkspaceSelection?.workspaceId,
+        agentId: focusedAgentId,
+      }),
+    );
+  }, [activeWorkspaceSelection, focusedAgentId]);
+
   const newWorkspaceKeys = useShortcutKeys("new-workspace");
   const labels = useMemo(
     (): SidebarLabels => ({
@@ -284,6 +305,7 @@ export const LeftSidebar = memo(function LeftSidebar({ active }: { active: boole
         handleOpenHostSettings={handleOpenHostSettingsDesktop}
         handleViewMore={handleViewMoreNavigate}
         handleViewSchedules={handleViewSchedulesNavigate}
+        handleViewWorkflows={handleViewWorkflowsNavigate}
       />
     </RetainedPanelActivity>
   );
@@ -758,12 +780,14 @@ function DesktopSidebar({
   active,
   handleViewMore,
   handleViewSchedules,
+  handleViewWorkflows,
 }: DesktopSidebarProps) {
   const ownsTopLeft = useOwnsWindowChromeCorner("top-left");
   const pathname = usePathname();
   const hasActiveHostFilter = useSidebarViewStore((state) => state.hostFilters.length > 0);
   const isSessionsActive = pathname.includes("/sessions");
   const isSchedulesActive = pathname.includes("/schedules");
+  const isWorkflowsActive = pathname.includes("/workflows");
   const sidebarWidth = usePanelStore((state) => state.sidebarWidth);
   const setSidebarWidth = usePanelStore((state) => state.setSidebarWidth);
   const { width: viewportWidth } = useWindowDimensions();
@@ -860,6 +884,16 @@ function DesktopSidebar({
               testID="sidebar-schedules"
               variant="compact"
             />
+            {isWeb ? (
+              <SidebarHeaderRow
+                icon={Workflow}
+                label="Workflows"
+                onPress={handleViewWorkflows}
+                isActive={isWorkflowsActive}
+                testID="sidebar-workflows"
+                variant="compact"
+              />
+            ) : null}
           </View>
         </View>
 
