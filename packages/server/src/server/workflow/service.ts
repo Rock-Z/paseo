@@ -708,7 +708,7 @@ export class WorkflowService {
       const role = requireRole(instance, active.agent);
       active.agentId = agentId;
       role.agentId = agentId;
-      if (state.stopRequested) {
+      if (state.stopRequested && state.reason !== "max_iterations") {
         const reason = state.reason === "requested" ? "stop_requested" : state.reason;
         cancelQueuedTurns(tx, reason ?? "stop_requested");
         finalizeRequestedStop(tx);
@@ -1639,7 +1639,7 @@ function isLimitReason(reason: string | null): reason is "max_iterations" | "max
 function applyLimit(tx: Transaction, reason: string): void {
   tx.state.stopRequested = true;
   tx.state.reason = reason;
-  cancelQueuedTurns(tx, reason);
+  if (reason !== "max_iterations") cancelQueuedTurns(tx, reason);
   tx.state.status = hasActiveTurns(tx.state) ? "stopping" : "stopped";
   tx.state.completedAt = tx.state.status === "stopped" ? new Date().toISOString() : null;
   queueEvent(tx, { type: "limit_reached", details: { reason } });

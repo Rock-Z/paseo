@@ -892,6 +892,87 @@ describe("WorkflowService runtime", () => {
     });
   });
 
+  it("lets a reserved queued turn run when another map child reaches max iterations", async () => {
+    const workflow = baseSpec();
+    workflow.inputs = { items: ["one", "two"] };
+    workflow.limits = { maxIterations: 1, maxRuntime: "1h" };
+    workflow.flows = {
+      main: {
+        initial: "fanout",
+        states: {
+          fanout: {
+            map: {
+              group: "items",
+              items: "{{ inputs.items }}",
+              as: "item",
+              call: { flow: "child", with: { value: "{{ item }}" } },
+              join: "all",
+              concurrency: 2,
+            },
+            on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+          },
+          finish: { return: { output: "{{ event.data.results }}" } },
+          failed: { stop: { reason: "{{ event.message }}" } },
+        },
+      },
+      child: {
+        initial: "work",
+        inputs: { value: "" },
+        states: {
+          work: {
+            turn: {
+              agent: "worker",
+              prompt: "child",
+              emits: { done: { description: "Child completed" } },
+            },
+            on: { done: "finish", "error.agent": "failed", "error.protocol": "failed" },
+          },
+          finish: { return: { output: "{{ inputs.value }}" } },
+          failed: { stop: { reason: "{{ event.message }}" } },
+        },
+      },
+    };
+    (workflow.prompts as JsonObject).child = "Process {{ inputs.value }}.";
+    const { service, adapter } = await setup(workflow);
+    let releaseIdle!: () => void;
+    adapter.idleGate = new Promise<void>((resolve) => {
+      releaseIdle = resolve;
+    });
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "unused" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForIdleWaits(1);
+    await waitForRunStatus(service, run.id, ["stopping", "stopped"]);
+
+    await expect(service.inspectRun(run.id)).resolves.toMatchObject({
+      run: {
+        status: "stopping",
+        reason: "max_iterations",
+        iteration: 1,
+        activeTurns: 1,
+      },
+    });
+    expect(adapter.starts).toHaveLength(0);
+
+    releaseIdle();
+    await adapter.waitForStarts(1);
+    const reserved = adapter.starts[0];
+    await service.emitEvent({
+      callerAgentId: reserved.request.agentId,
+      event: "done",
+      message: "completed inside the reservation budget",
+    });
+    adapter.complete(reserved.request.agentId);
+
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
+      status: "stopped",
+      reason: "max_iterations",
+    });
+    expect(adapter.starts).toHaveLength(1);
+  });
+
   it("accepts immediately, authorizes the active native turn, validates data, and routes by tool event", async () => {
     const { service, adapter } = await setup(baseSpec());
     let releaseValidation!: () => void;

@@ -1,4 +1,5 @@
 import { stat } from "node:fs/promises";
+import { basename } from "node:path";
 import type { Logger } from "pino";
 import type { AgentManager, ManagedAgent } from "../agent/agent-manager.js";
 import type { AgentStorage } from "../agent/agent-storage.js";
@@ -6,7 +7,7 @@ import { ensureAgentLoaded } from "../agent/agent-loading.js";
 import type { AgentModelDefinition } from "../agent/agent-sdk-types.js";
 import type { ProviderSnapshotManager } from "../agent/provider-snapshot-manager.js";
 import type { BoundCreateAgentCommand } from "../agent/create-agent/create.js";
-import type { WorkspaceRegistry } from "../workspace-registry.js";
+import type { PersistedWorkspaceRecord, WorkspaceRegistry } from "../workspace-registry.js";
 import type { CreatePaseoWorktreeWorkflowFn } from "../worktree-session.js";
 import { areEquivalentPaths } from "../../utils/path.js";
 import type {
@@ -95,18 +96,28 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     const target = objectValue(input.create.target, "createWorktree.target");
     const mode = stringValue(target.mode, "createWorktree.target.mode");
     const stableSlug = `workflow-${input.runId.slice(4, 16)}-${input.instanceId}`.toLowerCase();
+    const existing = (await this.workspaceRegistry.list())
+      .filter(
+        (workspace) =>
+          !workspace.archivedAt &&
+          workspace.kind === "worktree" &&
+          workspace.isPaseoOwnedWorktree &&
+          workspace.worktreeRoot !== null &&
+          basename(workspace.worktreeRoot) === stableSlug,
+      )
+      .sort(
+        (left, right) =>
+          left.createdAt.localeCompare(right.createdAt) ||
+          left.workspaceId.localeCompare(right.workspaceId),
+      )[0];
+    if (existing) return workflowWorkspace(existing);
     const result = await this.createPaseoWorktree({
       cwd: stringValue(input.create.cwd, "createWorktree.cwd"),
       worktreeSlug: stableSlug,
       ...(typeof input.create.name === "string" ? { title: input.create.name } : {}),
       ...worktreeTarget(mode, target),
     });
-    return {
-      workspaceId: result.workspace.workspaceId,
-      cwd: result.workspace.cwd,
-      name: result.workspace.title ?? result.workspace.displayName,
-      ...(result.workspace.branch ? { branch: result.workspace.branch } : {}),
-    };
+    return workflowWorkspace(result.workspace);
   }
 
   async resolveBoundWorkspace(input: {
@@ -117,12 +128,7 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     if (!areEquivalentPaths(workspace.cwd, input.worktreePath)) {
       throw new Error(`workspace ${input.workspaceId} does not own worktree ${input.worktreePath}`);
     }
-    return {
-      workspaceId: workspace.workspaceId,
-      cwd: workspace.cwd,
-      name: workspace.title ?? workspace.displayName,
-      ...(workspace.branch ? { branch: workspace.branch } : {}),
-    };
+    return workflowWorkspace(workspace);
   }
 
   async ensureAgent(input: {
@@ -573,6 +579,15 @@ function worktreeTarget(mode: string, target: JsonObject): JsonObject {
   return {
     action: "checkout",
     githubPrNumber: numberValue(target.prNumber, "target.prNumber"),
+  };
+}
+
+function workflowWorkspace(workspace: PersistedWorkspaceRecord): WorkflowWorkspace {
+  return {
+    workspaceId: workspace.workspaceId,
+    cwd: workspace.cwd,
+    name: workspace.title ?? workspace.displayName,
+    ...(workspace.branch ? { branch: workspace.branch } : {}),
   };
 }
 

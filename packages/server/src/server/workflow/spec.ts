@@ -555,6 +555,85 @@ function validateFlows(
       );
     }
   }
+  validateAcyclicFlowCalls(value, flowNames, issues);
+}
+
+interface FlowCallEdge {
+  target: string;
+  path: string;
+}
+
+function validateAcyclicFlowCalls(
+  flows: JsonObject,
+  flowNames: ReadonlySet<string>,
+  issues: Issues,
+): void {
+  const calls = new Map<string, FlowCallEdge[]>();
+  for (const [flowName, flowValue] of Object.entries(flows)) {
+    const edges: FlowCallEdge[] = [];
+    if (
+      !isObject(flowValue) ||
+      !isObject(flowValue.states) ||
+      typeof flowValue.initial !== "string"
+    ) {
+      calls.set(flowName, edges);
+      continue;
+    }
+    const visitedStates = new Set<string>();
+    let stateName: string | undefined = flowValue.initial;
+    while (stateName && !visitedStates.has(stateName)) {
+      visitedStates.add(stateName);
+      const stateValue: unknown = flowValue.states[stateName];
+      if (!isObject(stateValue)) break;
+      let action: JsonObject | null = null;
+      let actionPath: "call" | "map.call" | null = null;
+      let continuationEvent: "returned" | "joined" | null = null;
+      if (isObject(stateValue.call)) {
+        action = stateValue.call;
+        actionPath = "call";
+        continuationEvent = "returned";
+      } else if (isObject(stateValue.map) && isObject(stateValue.map.call)) {
+        action = stateValue.map.call;
+        actionPath = "map.call";
+        continuationEvent = "joined";
+      }
+      if (!action) break;
+      if (typeof action.flow === "string" && flowNames.has(action.flow)) {
+        edges.push({
+          target: action.flow,
+          path: `flows.${flowName}.states.${stateName}.${actionPath}.flow`,
+        });
+      }
+      const routes: JsonObject = isObject(stateValue.on) ? stateValue.on : {};
+      const continuation: unknown = continuationEvent ? routes[continuationEvent] : undefined;
+      stateName = typeof continuation === "string" ? continuation : undefined;
+    }
+    calls.set(flowName, edges);
+  }
+
+  const visited = new Set<string>();
+  const stack: string[] = [];
+  const stackIndexes = new Map<string, number>();
+  const visit = (flowName: string): void => {
+    if (visited.has(flowName)) return;
+    stackIndexes.set(flowName, stack.length);
+    stack.push(flowName);
+    for (const edge of calls.get(flowName) ?? []) {
+      const cycleStart = stackIndexes.get(edge.target);
+      if (cycleStart !== undefined) {
+        issues.add(
+          edge.path,
+          `recursive flow call cycle: ${[...stack.slice(cycleStart), edge.target].join(" -> ")}`,
+        );
+      } else {
+        visit(edge.target);
+      }
+    }
+    stack.pop();
+    stackIndexes.delete(flowName);
+    visited.add(flowName);
+  };
+  for (const flowName of flowNames) visit(flowName);
 }
 
 function validateState(

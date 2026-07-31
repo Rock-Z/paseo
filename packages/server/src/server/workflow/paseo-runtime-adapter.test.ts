@@ -197,6 +197,60 @@ describe("PaseoWorkflowRuntimeAdapter", () => {
     ).resolves.toEqual({ state: "missing" });
   });
 
+  it("reuses the native workspace record after worktree provisioning survives a restart", async () => {
+    const stableSlug = "workflow-abcdefghijkl-root";
+    const workspace = {
+      workspaceId: "workspace-stable",
+      projectId: "project-1",
+      cwd: `/paseo/worktrees/repo/${stableSlug}`,
+      kind: "worktree",
+      displayName: stableSlug,
+      title: "Workflow workspace",
+      branch: "workflow-branch",
+      worktreeRoot: `/paseo/worktrees/repo/${stableSlug}`,
+      baseBranch: "main",
+      isPaseoOwnedWorktree: true,
+      mainRepoRoot: "/repo",
+      createdAt: "2026-07-31T00:00:00.000Z",
+      updatedAt: "2026-07-31T00:00:00.000Z",
+      archivedAt: null,
+      pinnedAt: null,
+    };
+    let records: (typeof workspace)[] = [];
+    const createPaseoWorktree = vi.fn(async () => {
+      records = [workspace];
+      return { workspace };
+    });
+    const createAdapter = () =>
+      new PaseoWorkflowRuntimeAdapter({
+        agentManager: {} as never,
+        agentStorage: {} as never,
+        providerSnapshotManager: {} as never,
+        workspaceRegistry: { list: vi.fn(async () => records) } as never,
+        createAgent: (() => undefined) as never,
+        createPaseoWorktree: createPaseoWorktree as never,
+        logger: {} as never,
+      });
+    const request = {
+      runId: "wfr_abcdefghijklmnopqrstuv",
+      instanceId: "root",
+      create: {
+        cwd: "/repo",
+        target: { mode: "branch-off", base: "main" },
+      },
+    };
+
+    await expect(createAdapter().ensureWorkspace(request)).resolves.toMatchObject({
+      workspaceId: "workspace-stable",
+      cwd: workspace.cwd,
+    });
+    await expect(createAdapter().ensureWorkspace(request)).resolves.toMatchObject({
+      workspaceId: "workspace-stable",
+      cwd: workspace.cwd,
+    });
+    expect(createPaseoWorktree).toHaveBeenCalledOnce();
+  });
+
   it("does not validate unused create-agent fallback data for a bound role", async () => {
     const getProvider = vi.fn(async () => {
       throw new Error("fallback provider is unavailable");

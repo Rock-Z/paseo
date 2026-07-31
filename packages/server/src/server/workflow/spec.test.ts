@@ -263,6 +263,43 @@ describe("workflow spec validation and materialization", () => {
     });
   });
 
+  it("rejects recursive flow calls", () => {
+    const spec = baseSpec();
+    spec.flows = {
+      main: {
+        initial: "recurse",
+        states: {
+          recurse: {
+            call: { flow: "main" },
+            on: { returned: "finish" },
+          },
+          finish: { return: { output: "unreachable" } },
+        },
+      },
+    };
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "flows.main.states.recurse.call.flow",
+      message: "recursive flow call cycle: main -> main",
+    });
+  });
+
+  it("allows a recursive call when every invocation reaches a turn first", () => {
+    const spec = baseSpec();
+    const flows = spec.flows as Record<string, Record<string, unknown>>;
+    const main = flows.main;
+    const states = main.states as Record<string, Record<string, unknown>>;
+    (states.work.on as Record<string, unknown>).done = "recurse";
+    states.recurse = {
+      call: { flow: "main" },
+      on: { returned: "finish" },
+    };
+
+    expect(validateWorkflowTemplate(spec).valid).toBe(true);
+  });
+
   it("rejects a turn with no emitted events", () => {
     const spec = baseSpec();
     const flows = spec.flows as Record<string, Record<string, unknown>>;
