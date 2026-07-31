@@ -1935,7 +1935,7 @@ test("createAgent passes native Paseo tools through launch context without inter
   });
 });
 
-test("createAgent limits native Paseo tools to workflow events when operator tools are disabled", async () => {
+test("createAgent omits native Paseo tools when operator tools are disabled", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
@@ -1966,6 +1966,7 @@ test("createAgent limits native Paseo tools to workflow events when operator too
       return tool.handler(input, context ?? {});
     },
   };
+  const paseoToolCatalogFactory = vi.fn(() => paseoTools);
 
   class NativeToolsClient extends TestAgentClient {
     override readonly capabilities = {
@@ -1989,7 +1990,7 @@ test("createAgent limits native Paseo tools to workflow events when operator too
     registry: storage,
     logger,
     paseoToolsEnabled: false,
-    paseoToolCatalogFactory: () => paseoTools,
+    paseoToolCatalogFactory,
     idFactory: () => "00000000-0000-4000-8000-000000000107",
   });
 
@@ -1997,8 +1998,8 @@ test("createAgent limits native Paseo tools to workflow events when operator too
     workspaceId: undefined,
   });
 
-  expect([...client.lastLaunchContext!.paseoTools!.tools.keys()]).toEqual(["emit_event"]);
-  expect(client.lastLaunchContext?.paseoTools?.getTool("list_agents")).toBeUndefined();
+  expect(client.lastLaunchContext?.paseoTools).toBeUndefined();
+  expect(paseoToolCatalogFactory).not.toHaveBeenCalled();
 
   rmSync(workdir, { recursive: true, force: true });
 });

@@ -87,6 +87,7 @@ export class WorkflowService {
   private readonly runLockTails = new Map<string, Promise<void>>();
   private readonly agentLockTails = new Map<string, Promise<void>>();
   private readonly limitTimers = new Map<string, NodeJS.Timeout>();
+  private readonly specCache = new Map<string, JsonObject>();
   private initialized = false;
   private started = false;
   private disposed = false;
@@ -118,6 +119,7 @@ export class WorkflowService {
     this.pendingDriveKicks.clear();
     for (const timer of this.limitTimers.values()) clearTimeout(timer);
     this.limitTimers.clear();
+    this.specCache.clear();
   }
 
   async listSpecs(): Promise<WorkflowSpecSummary[]> {
@@ -368,7 +370,7 @@ export class WorkflowService {
     while (!this.disposed) {
       const state = parseState(await this.storage.readState(runId));
       if (isTerminal(state.status)) {
-        this.clearLimitTimer(runId);
+        this.releaseTerminalRun(runId);
         return;
       }
       if (state.status === "queued") {
@@ -410,24 +412,19 @@ export class WorkflowService {
   }
 
   private async updateElapsedAndLimits(runId: string): Promise<void> {
+    const spec = await this.getRunSpec(runId);
+    const limits = isObject(spec.limits) ? spec.limits : {};
     await this.transact(runId, (tx) => {
-      if (!tx.state.startedAt || isTerminal(tx.state.status)) return;
+      if (!tx.state.startedAt || tx.state.stopRequested || isTerminal(tx.state.status)) return;
       tx.state.loop.elapsedSeconds = Math.max(
         0,
         Math.floor((Date.now() - Date.parse(tx.state.startedAt)) / 1000),
       );
-      const reason = limitReason(tx.state, this.currentSpecLimits(runId));
+      const reason = limitReason(tx.state, limits);
       if (!reason) return;
       applyLimit(tx, reason);
     });
     await this.scheduleLimitTimer(runId);
-  }
-
-  private specCache = new Map<string, JsonObject>();
-
-  private currentSpecLimits(runId: string): JsonObject {
-    const spec = this.specCache.get(runId);
-    return spec && isObject(spec.limits) ? spec.limits : {};
   }
 
   private async getRunSpec(runId: string): Promise<JsonObject> {
@@ -441,14 +438,16 @@ export class WorkflowService {
   private async scheduleLimitTimer(runId: string): Promise<void> {
     this.clearLimitTimer(runId);
     const state = parseState(await this.storage.readState(runId));
+    if (!state.startedAt || state.stopRequested || isTerminal(state.status)) return;
     const spec = await this.getRunSpec(runId);
     const limits = isObject(spec.limits) ? spec.limits : {};
-    if (!state.startedAt || typeof limits.maxRuntime !== "string" || isTerminal(state.status))
-      return;
+    if (typeof limits.maxRuntime !== "string") return;
     const remaining =
       durationSeconds(limits.maxRuntime) * 1000 - (Date.now() - Date.parse(state.startedAt));
     const timer = setTimeout(
-      () => this.kick(runId),
+      () => {
+        void this.updateElapsedAndLimits(runId).catch((error) => this.failRun(runId, error));
+      },
       Math.min(Math.max(remaining, 1), MAX_TIMER_DELAY_MS),
     );
     timer.unref();
@@ -459,6 +458,11 @@ export class WorkflowService {
     const timer = this.limitTimers.get(runId);
     if (timer) clearTimeout(timer);
     this.limitTimers.delete(runId);
+  }
+
+  private releaseTerminalRun(runId: string): void {
+    this.clearLimitTimer(runId);
+    this.specCache.delete(runId);
   }
 
   private async provisionInstance(runId: string, instance: WorkflowInstance): Promise<void> {
@@ -1020,6 +1024,7 @@ export class WorkflowService {
       state: transaction.state as unknown as JsonObject,
       events: transaction.events,
     });
+    if (isTerminal(transaction.state.status)) this.releaseTerminalRun(runId);
   }
 
   private async withLock<T>(runId: string, callback: () => Promise<T>): Promise<T> {

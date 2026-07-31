@@ -37,6 +37,7 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
   }> = [];
   validationCalls = 0;
   validateGate: Promise<void> = Promise.resolve();
+  workspaceGate: Promise<void> = Promise.resolve();
   idleGate: Promise<void> = Promise.resolve();
   pauseAfterNativeSubmission = false;
   workspaceFailure: { instanceId: string; afterStarts: number; message: string } | null = null;
@@ -50,6 +51,7 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
   private agentIdleWaiters = new Map<string, Array<() => void>>();
   private reconciliationWaiters: Array<() => void> = [];
   private validationWaiters: Array<() => void> = [];
+  private workspaceWaiters: Array<() => void> = [];
 
   async resolveCallerContext(input: {
     workspaceId?: string;
@@ -73,6 +75,8 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     create: JsonObject;
   }): Promise<WorkflowWorkspace> {
     this.workspaceCreates.push(input.instanceId);
+    for (const resolve of this.workspaceWaiters.splice(0)) resolve();
+    await this.workspaceGate;
     if (this.workspaceFailure?.instanceId === input.instanceId) {
       await this.waitForStarts(this.workspaceFailure.afterStarts);
       throw new Error(this.workspaceFailure.message);
@@ -199,6 +203,12 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     if (this.validationCalls < count) await this.waitForValidations(count);
   }
 
+  async waitForWorkspaceCreates(count: number): Promise<void> {
+    if (this.workspaceCreates.length >= count) return;
+    await new Promise<void>((resolve) => this.workspaceWaiters.push(resolve));
+    if (this.workspaceCreates.length < count) await this.waitForWorkspaceCreates(count);
+  }
+
   complete(agentId: string, status: WorkflowTurnResult["status"] = "completed"): void {
     const pending = this.active.get(agentId);
     if (!pending) throw new Error(`no active turn for ${agentId}`);
@@ -269,6 +279,15 @@ class ReadHookWorkflowStorage extends WorkflowStorage {
     this.readHook = undefined;
     await hook.callback();
     return state;
+  }
+}
+
+class CountingReadHookWorkflowStorage extends ReadHookWorkflowStorage {
+  inspectRunCalls = 0;
+
+  override async inspectRun(runId: string) {
+    this.inspectRunCalls += 1;
+    return super.inspectRun(runId);
   }
 }
 
@@ -352,6 +371,19 @@ async function waitForActiveTurnPhase(
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`timed out waiting for workflow turn phase ${phase}`);
+}
+
+async function waitForStoredRunStatus(
+  storage: WorkflowStorage,
+  runId: string,
+  status: string,
+): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < 10_000) {
+    if ((await storage.readState(runId)).status === status) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for stored workflow run ${runId} status ${status}`);
 }
 
 function baseSpec(): JsonObject {
@@ -538,6 +570,85 @@ describe("WorkflowService runtime", () => {
     const details = await service.inspectRun(run.id);
     expect(details.run).toMatchObject({ status: "stopped", reason: "requested" });
     expect(details.events.filter((event) => event.type === "workspace_ready")).toHaveLength(0);
+  });
+
+  it("applies a runtime deadline while native workspace provisioning is blocked", async () => {
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const spec = baseSpec();
+    spec.bindings = {};
+    let releaseWorkspace!: () => void;
+    const { service, storage, adapter } = await setup(spec);
+    adapter.workspaceGate = new Promise<void>((resolve) => {
+      releaseWorkspace = resolve;
+    });
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Bound blocked provisioning" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForWorkspaceCreates(1);
+    const runtimeTimer = setTimeoutSpy.mock.calls
+      .toReversed()
+      .find((call) => typeof call[1] === "number" && call[1] > 3_000_000)?.[0];
+    expect(runtimeTimer).toBeTypeOf("function");
+
+    const state = await storage.readState(run.id);
+    state.startedAt = new Date(0).toISOString();
+    await storage.commitRunTransaction(run.id, { state, events: [] });
+    (runtimeTimer as () => void)();
+    (runtimeTimer as () => void)();
+
+    await expect(waitForRunStatus(service, run.id, ["stopped"], 1_000)).resolves.toMatchObject({
+      reason: "max_runtime",
+    });
+    const limited = await service.inspectRun(run.id);
+    expect(limited.events.filter((event) => event.type === "limit_reached")).toHaveLength(1);
+    expect(limited.events.filter((event) => event.type === "run_stopped")).toHaveLength(1);
+
+    releaseWorkspace();
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    const settled = await service.inspectRun(run.id);
+    expect(adapter.starts).toHaveLength(0);
+    expect(settled.events.filter((event) => event.type === "workspace_ready")).toHaveLength(0);
+  });
+
+  it("evicts a stopped run spec and reloads it when the run resumes", async () => {
+    const spec = baseSpec();
+    spec.bindings = {};
+    const main = (spec.flows as JsonObject).main as JsonObject;
+    main.initial = "finish";
+    main.states = { finish: { return: { output: "resumed" } } };
+    const { service, storage, adapter } = await setup(
+      spec,
+      (options) => new CountingReadHookWorkflowStorage(options),
+    );
+    let releaseValidation!: () => void;
+    adapter.validateGate = new Promise<void>((resolve) => {
+      releaseValidation = resolve;
+    });
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Reload the durable materialized spec" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForValidations(1);
+    await expect(service.stopRun(run.id)).resolves.toMatchObject({ status: "stopped" });
+
+    let observedTerminalRead!: () => void;
+    const terminalRead = new Promise<void>((resolve) => {
+      observedTerminalRead = resolve;
+    });
+    storage.armReadHook((state) => state.status === "stopped", observedTerminalRead);
+    releaseValidation();
+    await terminalRead;
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const inspectCallsBeforeResume = storage.inspectRunCalls;
+    await service.resumeRun(run.id);
+    await waitForStoredRunStatus(storage, run.id, "complete");
+    expect(storage.inspectRunCalls - inspectCallsBeforeResume).toBe(3);
+    expect(adapter.starts).toHaveLength(0);
   });
 
   it("queues caller reuse immediately and waits for the invoking turn to become idle", async () => {
