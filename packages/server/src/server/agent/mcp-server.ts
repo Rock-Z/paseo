@@ -8,9 +8,14 @@ import type {
 
 import { addModelVisibleStructuredContent } from "./tools/paseo-tool-serialization.js";
 import { createPaseoToolCatalog, type PaseoToolHostDependencies } from "./tools/paseo-tools.js";
+import { selectPaseoTools } from "./tools/tool-scope.js";
 import type { PaseoToolResult } from "./tools/types.js";
 
 export type AgentMcpServerOptions = PaseoToolHostDependencies;
+
+export interface AgentMcpToolOptions {
+  toolNames?: readonly string[];
+}
 
 type McpToolContext = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
@@ -28,8 +33,14 @@ function toMcpToolResult(result: PaseoToolResult): CallToolResult {
   };
 }
 
-export async function createAgentMcpServer(options: AgentMcpServerOptions): Promise<McpServer> {
-  const catalog = await createPaseoToolCatalog(options);
+export async function createAgentMcpServer(
+  options: AgentMcpServerOptions,
+  toolOptions: AgentMcpToolOptions = {},
+): Promise<McpServer> {
+  const fullCatalog = await createPaseoToolCatalog(options);
+  const catalog = toolOptions.toolNames
+    ? selectPaseoTools(fullCatalog, toolOptions.toolNames)
+    : fullCatalog;
   const server = new McpServer({
     name: "agent-mcp",
     version: "2.0.0",

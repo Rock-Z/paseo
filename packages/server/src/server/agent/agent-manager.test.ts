@@ -1935,6 +1935,74 @@ test("createAgent passes native Paseo tools through launch context without inter
   });
 });
 
+test("createAgent limits native Paseo tools to workflow events when operator tools are disabled", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const tools = new Map([
+    [
+      "emit_event",
+      {
+        name: "emit_event",
+        description: "Emit a workflow event",
+        handler: async () => ({ content: [] }),
+      },
+    ],
+    [
+      "list_agents",
+      {
+        name: "list_agents",
+        description: "List agents",
+        handler: async () => ({ content: [] }),
+      },
+    ],
+  ]);
+  const paseoTools: PaseoToolCatalog = {
+    tools,
+    getTool: (name) => tools.get(name),
+    executeTool: async (name, input, context) => {
+      const tool = tools.get(name);
+      if (!tool) throw new Error(`Paseo tool not found: ${name}`);
+      return tool.handler(input, context ?? {});
+    },
+  };
+
+  class NativeToolsClient extends TestAgentClient {
+    override readonly capabilities = {
+      ...TEST_CAPABILITIES,
+      supportsNativePaseoTools: true,
+    };
+    lastLaunchContext: AgentLaunchContext | undefined;
+
+    override async createSession(
+      config: AgentSessionConfig,
+      launchContext?: AgentLaunchContext,
+    ): Promise<AgentSession> {
+      this.lastLaunchContext = launchContext;
+      return new TestAgentSession(config);
+    }
+  }
+
+  const client = new NativeToolsClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    paseoToolsEnabled: false,
+    paseoToolCatalogFactory: () => paseoTools,
+    idFactory: () => "00000000-0000-4000-8000-000000000107",
+  });
+
+  await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+
+  expect([...client.lastLaunchContext!.paseoTools!.tools.keys()]).toEqual(["emit_event"]);
+  expect(client.lastLaunchContext?.paseoTools?.getTool("list_agents")).toBeUndefined();
+
+  rmSync(workdir, { recursive: true, force: true });
+});
+
 test("createAgent injects the MCP auth token as a bearer header into the launch config", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");

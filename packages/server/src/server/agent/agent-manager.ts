@@ -68,6 +68,7 @@ import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import type { PaseoToolCatalogFactory } from "./tools/types.js";
+import { selectPaseoTools, WORKFLOW_EVENT_TOOL_NAMES } from "./tools/tool-scope.js";
 import {
   ProviderSubagentStore,
   type ProviderSubagentDescriptor,
@@ -4190,12 +4191,11 @@ export class AgentManager {
         PASEO_AGENT_CWD: cwd,
       },
     };
-    if (
-      this.paseoToolsEnabled &&
-      client.capabilities.supportsNativePaseoTools &&
-      this.paseoToolCatalogFactory
-    ) {
-      context.paseoTools = await this.paseoToolCatalogFactory({ callerAgentId: agentId });
+    if (client.capabilities.supportsNativePaseoTools && this.paseoToolCatalogFactory) {
+      const catalog = await this.paseoToolCatalogFactory({ callerAgentId: agentId });
+      context.paseoTools = this.paseoToolsEnabled
+        ? catalog
+        : selectPaseoTools(catalog, WORKFLOW_EVENT_TOOL_NAMES);
     }
     return context;
   }

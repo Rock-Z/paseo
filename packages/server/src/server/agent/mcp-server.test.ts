@@ -56,6 +56,7 @@ import type { BrowserToolsBroker, BrowserToolsExecuteInput } from "../browser-to
 import type { BrowserToolsResponsePayload } from "../browser-tools/errors.js";
 import { readPaseoWorktreeMetadata } from "../../utils/worktree-metadata.js";
 import { createWorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
+import type { WorkflowService } from "../workflow/service.js";
 
 const REPO_CWD = resolvePath("/tmp/repo");
 const TARGET_CWD = resolvePath("/tmp/target");
@@ -1055,6 +1056,32 @@ describe("browser MCP tools", () => {
       },
       context: { agentId: "agent-1", cwd: REPO_CWD },
     });
+  });
+});
+
+describe("scoped MCP tools", () => {
+  it("exposes only emit_event when operator Paseo tools are disabled", async () => {
+    const server = await createAgentMcpServer(
+      {
+        agentManager: new BoundaryAgentManagerFake() as AgentManager,
+        agentStorage: new BoundaryAgentStorageFake() as AgentStorage,
+        providerSnapshotManager:
+          new BoundaryProviderSnapshotManagerFake() as unknown as ProviderSnapshotManager,
+        workflowService: {} as WorkflowService,
+        callerAgentId: "agent-1",
+        logger: createTestLogger(),
+      },
+      { toolNames: ["emit_event"] },
+    );
+    const client = await connectInMemoryMcpClient(server);
+
+    try {
+      const listedTools = await client.listTools();
+      expect(listedTools.tools.map((tool) => tool.name)).toEqual(["emit_event"]);
+    } finally {
+      await client.close();
+      await server.close();
+    }
   });
 });
 

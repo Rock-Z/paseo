@@ -103,6 +103,10 @@ Terminal `complete`, `failed`, and limit-stopped runs do not restart.
 `emit_event` is a native Paseo tool. Providers may expose the transport-neutral Paseo tool catalog
 through their own adapter; MCP injection is not required.
 
+Disabling **Enable Paseo tools** removes the operator catalog from agent sessions but leaves
+`emit_event` available. The event tool is inert outside an active workflow turn, so this exception
+does not grant ordinary agents access to agent, workspace, schedule, or workflow controls.
+
 The tool has no workflow capability token. `WorkflowService` resolves authorization from:
 
 1. the caller agent attached by Paseo's tool catalog
