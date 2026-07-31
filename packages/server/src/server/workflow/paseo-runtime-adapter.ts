@@ -38,7 +38,10 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
   private readonly createAgent: BoundCreateAgentCommand;
   private readonly createPaseoWorktree: CreatePaseoWorktreeWorkflowFn;
   private readonly logger: Logger;
-  private readonly resumedNativeTurns = new Map<string, string>();
+  private readonly resumedTurns = new Map<
+    string,
+    { nativeTurnId: string; clientMessageId: string }
+  >();
 
   constructor(options: PaseoWorkflowRuntimeAdapterOptions) {
     this.agentManager = options.agentManager;
@@ -245,7 +248,7 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
       // A restored provider may call a native Paseo tool as soon as its session
       // reconnects. Publish the persisted identity before loading that session;
       // getActiveTurnId still prefers a different live foreground turn.
-      this.resumedNativeTurns.set(input.agentId, input.nativeTurnId);
+      this.publishResumedTurn(input.agentId, input.nativeTurnId, input.clientMessageId);
     }
     let agent = await this.loadAgent(input.agentId);
     const durable = await this.findHistoricalTurnResult(
@@ -283,23 +286,28 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
         result,
       };
     }
-    if (
-      this.isAgentBusy(input.agentId) &&
-      (await this.hasSubmittedWorkflowTurn(input.agentId, input.clientMessageId))
-    ) {
-      const result = this.withResumedTurnCleanup(
-        input.agentId,
-        input.nativeTurnId,
-        this.waitForTurnResult(input.agentId, input.nativeTurnId, input.clientMessageId, true),
-      );
-      if (!input.nativeTurnId) {
-        return { state: "completed", result: await result };
+    if (!activeTurnId && this.isAgentBusy(input.agentId)) {
+      const submittedWorkflowTurn =
+        input.nativeTurnId !== null
+          ? await this.hasSubmittedWorkflowTurn(input.agentId, input.clientMessageId)
+          : await this.isLatestSubmittedWorkflowTurn(input.agentId, input.clientMessageId);
+      if (submittedWorkflowTurn) {
+        const nativeTurnId =
+          input.nativeTurnId ?? (await this.waitForActiveAutonomousTurnId(input.agentId));
+        if (nativeTurnId) {
+          this.publishResumedTurn(input.agentId, nativeTurnId, input.clientMessageId);
+          const result = this.withResumedTurnCleanup(
+            input.agentId,
+            nativeTurnId,
+            this.waitForTurnResult(input.agentId, nativeTurnId, input.clientMessageId, true),
+          );
+          return {
+            state: "active",
+            nativeTurnId,
+            result,
+          };
+        }
       }
-      return {
-        state: "active",
-        nativeTurnId: input.nativeTurnId,
-        result,
-      };
     }
     const historical = await this.findHistoricalTurnResult(
       input.agentId,
@@ -313,13 +321,16 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
   getActiveTurnId(agentId: string): string | null {
     return (
       this.agentManager.getAgent(agentId)?.activeForegroundTurnId ??
-      this.resumedNativeTurns.get(agentId) ??
+      this.resumedTurns.get(agentId)?.nativeTurnId ??
       null
     );
   }
 
   getActiveTurnClientMessageId(agentId: string): string | null {
-    return this.agentManager.getActiveForegroundClientMessageId(agentId);
+    const foreground = this.agentManager.getAgent(agentId)?.activeForegroundTurnId;
+    return foreground
+      ? this.agentManager.getActiveForegroundClientMessageId(agentId)
+      : (this.resumedTurns.get(agentId)?.clientMessageId ?? null);
   }
 
   private async validateAgentCreate(create: JsonObject, cwd: string, path: string): Promise<void> {
@@ -389,7 +400,10 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     );
   }
 
-  private async waitForAgentStateChange(agentId: string): Promise<void> {
+  private async waitForAgentStateChange(
+    agentId: string,
+    isReady: () => boolean = () => !this.isAgentBusy(agentId),
+  ): Promise<void> {
     await new Promise<void>((resolve) => {
       let settled = false;
       let unsubscribe: () => void = () => undefined;
@@ -406,7 +420,7 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
         },
         { agentId, replayState: false },
       );
-      if (!this.isAgentBusy(agentId)) finish();
+      if (isReady()) finish();
     });
   }
 
@@ -442,6 +456,29 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     return rows.some(
       (row) => row.item.type === "user_message" && row.item.clientMessageId === clientMessageId,
     );
+  }
+
+  private async isLatestSubmittedWorkflowTurn(
+    agentId: string,
+    clientMessageId: string,
+  ): Promise<boolean> {
+    const rows = await this.agentManager.getTimelineRows(agentId);
+    const latest = rows.findLast((row) => row.item.type === "user_message");
+    return latest?.item.type === "user_message" && latest.item.clientMessageId === clientMessageId;
+  }
+
+  private async waitForActiveAutonomousTurnId(agentId: string): Promise<string | null> {
+    while (this.isAgentBusy(agentId)) {
+      const nativeTurnId = this.agentManager.getActiveAutonomousTurnId(agentId);
+      if (nativeTurnId) return nativeTurnId;
+      await this.waitForAgentStateChange(
+        agentId,
+        () =>
+          this.agentManager.getActiveAutonomousTurnId(agentId) !== null ||
+          !this.isAgentBusy(agentId),
+      );
+    }
+    return null;
   }
 
   private async waitForResumedTurn(agentId: string, clientMessageId: string): Promise<void> {
@@ -491,9 +528,13 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
   }
 
   private clearResumedTurn(agentId: string, nativeTurnId: string | null): void {
-    if (nativeTurnId && this.resumedNativeTurns.get(agentId) === nativeTurnId) {
-      this.resumedNativeTurns.delete(agentId);
+    if (nativeTurnId && this.resumedTurns.get(agentId)?.nativeTurnId === nativeTurnId) {
+      this.resumedTurns.delete(agentId);
     }
+  }
+
+  private publishResumedTurn(agentId: string, nativeTurnId: string, clientMessageId: string): void {
+    this.resumedTurns.set(agentId, { nativeTurnId, clientMessageId });
   }
 
   private async findHistoricalTurnResult(

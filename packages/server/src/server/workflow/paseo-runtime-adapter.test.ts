@@ -296,6 +296,7 @@ describe("PaseoWorkflowRuntimeAdapter", () => {
           return () => undefined;
         }),
         hasInFlightRun: vi.fn(() => busy),
+        getActiveAutonomousTurnId: vi.fn(() => null),
       } as never,
       agentStorage: {} as never,
       providerSnapshotManager: {} as never,
@@ -336,6 +337,145 @@ describe("PaseoWorkflowRuntimeAdapter", () => {
         lastError: null,
       },
     });
+  });
+
+  it("publishes a recovered autonomous turn identity before that turn settles", async () => {
+    const rows: Array<{
+      item:
+        | { type: "user_message"; clientMessageId: string }
+        | { type: "assistant_message"; text: string };
+    }> = [
+      {
+        item: {
+          type: "user_message",
+          clientMessageId: "client-workflow",
+        },
+      },
+    ];
+    const agent = {
+      id: "agent-workflow",
+      activeForegroundTurnId: null,
+      lifecycle: "running",
+      recentTurnReceipts: [],
+    };
+    let busy = true;
+    let autonomousTurnId: string | null = null;
+    let autonomousTurnIdReads = 0;
+    let publishAgentState: ((event: { type: "agent_state" }) => void) | null = null;
+    const adapter = new PaseoWorkflowRuntimeAdapter({
+      agentManager: {
+        getAgent: vi.fn(() => agent),
+        getActiveForegroundClientMessageId: vi.fn(() => null),
+        getActiveAutonomousTurnId: vi.fn(() => {
+          autonomousTurnIdReads += 1;
+          if (autonomousTurnIdReads === 1) {
+            autonomousTurnId = "native-recovered";
+            return null;
+          }
+          return autonomousTurnId;
+        }),
+        getTimelineRows: vi.fn(async () => rows),
+        subscribe: vi.fn((callback) => {
+          publishAgentState = callback;
+          return () => undefined;
+        }),
+        hasInFlightRun: vi.fn(() => busy),
+      } as never,
+      agentStorage: {} as never,
+      providerSnapshotManager: {} as never,
+      workspaceRegistry: {} as never,
+      createAgent: (() => undefined) as never,
+      createPaseoWorktree: (() => undefined) as never,
+      logger: {} as never,
+    });
+
+    const reconciliationPromise = adapter.reconcileTurn({
+      agentId: agent.id,
+      nativeTurnId: null,
+      clientMessageId: "client-workflow",
+    });
+    await vi.waitFor(() => {
+      expect(adapter.getActiveTurnId(agent.id)).toBe("native-recovered");
+      expect(adapter.getActiveTurnClientMessageId(agent.id)).toBe("client-workflow");
+    });
+    const reconciliation = await reconciliationPromise;
+    expect(reconciliation).toMatchObject({
+      state: "active",
+      nativeTurnId: "native-recovered",
+    });
+    if (reconciliation.state !== "active") throw new Error("Expected active reconciliation");
+
+    busy = false;
+    autonomousTurnId = null;
+    agent.lifecycle = "idle";
+    rows.push({
+      item: {
+        type: "assistant_message",
+        text: "settled response",
+      },
+    });
+    publishAgentState?.({ type: "agent_state" });
+
+    await expect(reconciliation.result).resolves.toMatchObject({
+      agentId: agent.id,
+      nativeTurnId: "native-recovered",
+      status: "completed",
+      lastMessage: "settled response",
+    });
+    expect(adapter.getActiveTurnId(agent.id)).toBeNull();
+    expect(adapter.getActiveTurnClientMessageId(agent.id)).toBeNull();
+  });
+
+  it("does not adopt an autonomous turn after a newer native user message", async () => {
+    const agent = {
+      id: "agent-shared",
+      activeForegroundTurnId: null,
+      lifecycle: "running",
+      recentTurnReceipts: [],
+    };
+    const subscribe = vi.fn(() => {
+      throw new Error("waited on an unrelated autonomous turn");
+    });
+    const adapter = new PaseoWorkflowRuntimeAdapter({
+      agentManager: {
+        getAgent: vi.fn(() => agent),
+        getActiveForegroundClientMessageId: vi.fn(() => null),
+        getActiveAutonomousTurnId: vi.fn(() => "native-unrelated"),
+        getTimelineRows: vi.fn(async () => [
+          {
+            item: {
+              type: "user_message",
+              clientMessageId: "client-workflow",
+            },
+          },
+          {
+            item: {
+              type: "user_message",
+              clientMessageId: "client-unrelated",
+            },
+          },
+        ]),
+        subscribe,
+        hasInFlightRun: vi.fn(() => true),
+      } as never,
+      agentStorage: {} as never,
+      providerSnapshotManager: {} as never,
+      workspaceRegistry: {} as never,
+      createAgent: (() => undefined) as never,
+      createPaseoWorktree: (() => undefined) as never,
+      logger: {} as never,
+    });
+
+    await expect(
+      adapter.reconcileTurn({
+        agentId: agent.id,
+        nativeTurnId: null,
+        clientMessageId: "client-workflow",
+      }),
+    ).resolves.toMatchObject({ state: "completed" });
+    expect(adapter.getActiveTurnId(agent.id)).toBeNull();
+    expect(adapter.getActiveTurnClientMessageId(agent.id)).toBeNull();
+    expect(subscribe).not.toHaveBeenCalled();
   });
 
   it("reuses the native workspace record after worktree provisioning survives a restart", async () => {

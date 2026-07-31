@@ -763,6 +763,11 @@ export class AgentManager {
     );
   }
 
+  getActiveAutonomousTurnId(agentId: string): string | null {
+    const run = this.runs.getRun(agentId);
+    return run?.kind === "autonomous" ? run.turnId : null;
+  }
+
   getActiveForegroundClientMessageId(agentId: string): string | null {
     const agent = this.agents.get(agentId);
     const run = this.runs.getPendingRun(agentId);

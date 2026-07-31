@@ -4894,11 +4894,14 @@ test("applies live autonomous events and preserves usage omitted from completion
 
   // Push autonomous events through the session's subscribe() callbacks
   const autonomousTurnId = "autonomous-turn-1";
+  const running = waitForAgentLifecycle(manager, snapshot.id, "running");
   capturedSession!.pushEvent({
     type: "turn_started",
     provider: "codex",
     turnId: autonomousTurnId,
   });
+  await running;
+  expect(manager.getActiveAutonomousTurnId(snapshot.id)).toBe(autonomousTurnId);
   capturedSession!.pushEvent({
     type: "usage_updated",
     provider: "codex",
@@ -4923,6 +4926,7 @@ test("applies live autonomous events and preserves usage omitted from completion
   await settled;
 
   const updated = manager.getAgent(snapshot.id);
+  expect(manager.getActiveAutonomousTurnId(snapshot.id)).toBeNull();
   expect(updated?.lifecycle).toBe("idle");
   expect(updated?.lastUsage).toEqual({
     inputTokens: 10,
