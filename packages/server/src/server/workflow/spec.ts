@@ -616,7 +616,15 @@ function validateTurn(
   if (!issues.object(value.emits, `${path}.turn.emits`)) {
     return allowed;
   }
-  for (const [event, declaration] of Object.entries(value.emits)) {
+  const eventDeclarations = Object.entries(value.emits);
+  if (eventDeclarations.length === 0) {
+    issues.add(`${path}.turn.emits`, "must declare at least one event");
+  }
+  for (const [event, declaration] of eventDeclarations) {
+    if (!event.trim()) {
+      issues.add(`${path}.turn.emits`, "event names must be non-empty strings");
+      continue;
+    }
     validateEventDeclaration(event, declaration, path, routes, allowed, issues);
   }
   return allowed;

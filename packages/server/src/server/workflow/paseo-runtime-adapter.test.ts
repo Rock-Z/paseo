@@ -3,6 +3,62 @@ import { PaseoWorkflowRuntimeAdapter } from "./paseo-runtime-adapter.js";
 import type { JsonObject } from "./spec.js";
 
 describe("PaseoWorkflowRuntimeAdapter", () => {
+  it("does not report an unrelated foreground turn as the workflow turn", async () => {
+    const unsubscribe = vi.fn();
+    const subscribe = vi.fn(
+      (
+        callback: (event: {
+          type: "agent_state";
+          agent: { activeForegroundTurnId: string };
+        }) => void,
+      ) => {
+        callback({
+          type: "agent_state",
+          agent: { activeForegroundTurnId: "native-other" },
+        });
+        return unsubscribe;
+      },
+    );
+    const runAgent = vi.fn(async () => {
+      throw new Error("Agent agent-shared already has an active run");
+    });
+    const adapter = new PaseoWorkflowRuntimeAdapter({
+      agentManager: {
+        subscribe,
+        getActiveForegroundClientMessageId: vi.fn(() => "client-other"),
+        runAgent,
+      } as never,
+      agentStorage: {} as never,
+      providerSnapshotManager: {} as never,
+      workspaceRegistry: {} as never,
+      createAgent: (() => undefined) as never,
+      createPaseoWorktree: (() => undefined) as never,
+      logger: {} as never,
+    });
+
+    const turn = adapter.startTurn({
+      runId: "run-shared",
+      workflowTurnId: "workflow-turn",
+      clientMessageId: "client-workflow",
+      instanceId: "root",
+      agentId: "agent-shared",
+      prompt: "Do workflow work",
+      labels: {},
+    });
+
+    await expect(turn.nativeTurnId).resolves.toBeNull();
+    await expect(turn.result).resolves.toMatchObject({
+      agentId: "agent-shared",
+      nativeTurnId: null,
+      status: "failed",
+      lastError: "Agent agent-shared already has an active run",
+    });
+    expect(runAgent).toHaveBeenCalledWith("agent-shared", "Do workflow work", {
+      clientMessageId: "client-workflow",
+    });
+    expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
   it("recovers a canceled native turn from its durable terminal receipt", async () => {
     const agent = {
       id: "agent-workflow",

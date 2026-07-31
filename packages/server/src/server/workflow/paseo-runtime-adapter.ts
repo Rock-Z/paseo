@@ -191,7 +191,13 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     });
     const unsubscribe = this.agentManager.subscribe(
       (event) => {
-        if (event.type === "agent_state" && event.agent.activeForegroundTurnId && !nativeTurnId) {
+        if (
+          event.type === "agent_state" &&
+          event.agent.activeForegroundTurnId &&
+          this.agentManager.getActiveForegroundClientMessageId(request.agentId) ===
+            request.clientMessageId &&
+          !nativeTurnId
+        ) {
           nativeTurnId = event.agent.activeForegroundTurnId;
           resolveStarted(nativeTurnId);
         }

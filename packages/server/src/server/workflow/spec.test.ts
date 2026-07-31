@@ -244,6 +244,36 @@ describe("workflow spec validation and materialization", () => {
     });
   });
 
+  it("rejects a turn with no emitted events", () => {
+    const spec = baseSpec();
+    const flows = spec.flows as Record<string, Record<string, unknown>>;
+    const states = flows.main.states as Record<string, Record<string, Record<string, unknown>>>;
+    states.work.turn.emits = {};
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "flows.main.states.work.turn.emits",
+      message: "must declare at least one event",
+    });
+  });
+
+  it.each(["", "   "])("rejects an empty emitted event name %j", (event) => {
+    const spec = baseSpec();
+    const flows = spec.flows as Record<string, Record<string, unknown>>;
+    const states = flows.main.states as Record<string, Record<string, Record<string, unknown>>>;
+    states.work.turn.emits = {
+      [event]: { description: "Cannot be emitted reliably" },
+    };
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "flows.main.states.work.turn.emits",
+      message: "event names must be non-empty strings",
+    });
+  });
+
   it.each([
     ["workspace", ""],
     ["workspace", "   "],
