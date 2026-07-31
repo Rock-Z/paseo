@@ -31,6 +31,7 @@ test.describe("Native workflows", () => {
     const name = uniqueWorkflowName("ui");
     const spec = buildTwoTurnWorkflow({ name, delayMs: 1_500 });
     try {
+      await enablePaseoTools(workspace.client);
       await page.goto(
         buildWorkflowsRoute({
           serverId: getServerId(),
@@ -95,8 +96,8 @@ test.describe("Native workflows", () => {
     page,
   }, testInfo) => {
     const workspace = await seedWorkspace({ repoPrefix: "workflow-demos-" });
-    const nonce = Date.now().toString(36);
     try {
+      await enablePaseoTools(workspace.client);
       const goalRunId = await startWorkflow(workspace.client, {
         workflowId: "goal",
         workspaceId: workspace.workspaceId,
@@ -120,7 +121,6 @@ test.describe("Native workflows", () => {
         workspaceId: workspace.workspaceId,
         parameters: {
           repoCwd: workspace.repoPath,
-          prefix: `reviewed-${nonce}`,
           baseBranch: "main",
           workerProvider: "mock",
           workerModel: "ten-second-stream",
@@ -195,6 +195,7 @@ test.describe("Native workflows", () => {
     const workspace = await seedWorkspace({ repoPrefix: "workflow-stop-resume-" });
     const name = uniqueWorkflowName("stop-resume");
     try {
+      await enablePaseoTools(workspace.client);
       await saveWorkflow(workspace.client, buildTwoTurnWorkflow({ name, delayMs: 8_000 }));
       await page.goto(
         buildWorkflowsRoute({
@@ -255,6 +256,7 @@ test.describe("Native workflows", () => {
     try {
       daemon = await startIsolatedHostDaemon(serverId);
       client = await connectSeedClient({ port: daemon.port });
+      await enablePaseoTools(client);
       const created = await client.createWorkspace({
         source: { kind: "directory", path: repo.path },
         title: "Workflow restart fixture",
@@ -393,6 +395,10 @@ function acceptedEvents(details: WorkflowRunDetails): string[] {
   return details.events.flatMap((event) =>
     event.type === "event_accepted" && event.event ? [event.event] : [],
   );
+}
+
+async function enablePaseoTools(client: SeedDaemonClient): Promise<void> {
+  await client.patchDaemonConfig({ mcp: { injectIntoAgents: true } });
 }
 
 function workflowCompletedTurns(

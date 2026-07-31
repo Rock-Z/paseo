@@ -19,8 +19,8 @@ export interface WorkflowTurnResult {
   lastError: string | null;
 }
 
-export interface WorkflowStartedTurn {
-  nativeTurnId: string | null;
+export interface WorkflowTurnHandle {
+  nativeTurnId: Promise<string | null>;
   result: Promise<WorkflowTurnResult>;
 }
 
@@ -65,7 +65,12 @@ export interface WorkflowRuntimeAdapter {
     existingAgentId: string | null;
   }): Promise<string>;
   waitUntilAgentIdle(agentId: string): Promise<void>;
-  beginTurn(request: WorkflowTurnRequest): Promise<WorkflowStartedTurn>;
+  /**
+   * Initiate the durable native request before returning. WorkflowService calls
+   * this while holding the run lock so stop cannot be acknowledged between its
+   * final state check and native submission.
+   */
+  startTurn(request: WorkflowTurnRequest): WorkflowTurnHandle;
   reconcileTurn(request: {
     agentId: string;
     nativeTurnId: string | null;

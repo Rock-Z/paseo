@@ -5,7 +5,7 @@ import type { WorkflowRunSummary } from "@getpaseo/protocol/workflow/types";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   WorkflowRuntimeAdapter,
-  WorkflowStartedTurn,
+  WorkflowTurnHandle,
   WorkflowTurnReconciliation,
   WorkflowTurnRequest,
   WorkflowTurnResult,
@@ -98,7 +98,7 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     await this.idleGate;
   }
 
-  async beginTurn(request: WorkflowTurnRequest): Promise<WorkflowStartedTurn> {
+  startTurn(request: WorkflowTurnRequest): WorkflowTurnHandle {
     const nativeTurnId = `native-turn-${this.nextTurn++}`;
     let resolve!: (result: WorkflowTurnResult) => void;
     const result = new Promise<WorkflowTurnResult>((resolvePromise) => {
@@ -112,10 +112,13 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     this.maxActive = Math.max(this.maxActive, this.active.size);
     if (this.pauseAfterNativeSubmission) {
       this.flushWaiters();
-      return new Promise<WorkflowStartedTurn>(() => undefined);
+      return {
+        nativeTurnId: new Promise<string | null>(() => undefined),
+        result,
+      };
     }
     this.flushWaiters();
-    return { nativeTurnId, result };
+    return { nativeTurnId: Promise.resolve(nativeTurnId), result };
   }
 
   async reconcileTurn(input: {

@@ -11,7 +11,7 @@ import type { CreatePaseoWorktreeWorkflowFn } from "../worktree-session.js";
 import { areEquivalentPaths } from "../../utils/path.js";
 import type {
   WorkflowRuntimeAdapter,
-  WorkflowStartedTurn,
+  WorkflowTurnHandle,
   WorkflowTurnReconciliation,
   WorkflowTurnRequest,
   WorkflowTurnResult,
@@ -179,8 +179,7 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
     }
   }
 
-  async beginTurn(request: WorkflowTurnRequest): Promise<WorkflowStartedTurn> {
-    await this.loadAgent(request.agentId);
+  startTurn(request: WorkflowTurnRequest): WorkflowTurnHandle {
     let nativeTurnId: string | null = null;
     let resolveStarted!: (turnId: string) => void;
     const started = new Promise<string>((resolve) => {
@@ -215,19 +214,8 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
           lastError: errorMessage(error),
         }),
       );
-    const first = await Promise.race([
-      started.then((turnId) => ({ kind: "started" as const, turnId })),
-      result.then((turnResult) => ({ kind: "result" as const, turnResult })),
-    ]);
-    if (first.kind === "result") {
-      unsubscribe();
-      return {
-        nativeTurnId: first.turnResult.nativeTurnId,
-        result: Promise.resolve(first.turnResult),
-      };
-    }
     return {
-      nativeTurnId: first.turnId,
+      nativeTurnId: Promise.race([started, result.then((turnResult) => turnResult.nativeTurnId)]),
       result: result.finally(unsubscribe),
     };
   }

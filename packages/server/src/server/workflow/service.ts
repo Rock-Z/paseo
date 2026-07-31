@@ -9,7 +9,7 @@ import type {
 import Ajv2020 from "ajv/dist/2020.js";
 import type {
   WorkflowRuntimeAdapter,
-  WorkflowStartedTurn,
+  WorkflowTurnHandle,
   WorkflowTurnReconciliation,
   WorkflowTurnResult,
 } from "./runtime-adapter.js";
@@ -608,7 +608,7 @@ export class WorkflowService {
       (candidate) => candidate.name === turn.promptPath,
     )?.content;
     if (prompt === undefined) throw new Error(`rendered prompt is missing: ${turn.promptPath}`);
-    const started = await this.beginTurnIfAllowed(runId, instanceId, turn.workflowTurnId, agentId, {
+    const started = await this.startTurnIfAllowed(runId, instanceId, turn.workflowTurnId, agentId, {
       runId,
       workflowTurnId: turn.workflowTurnId,
       clientMessageId: turn.clientMessageId,
@@ -625,16 +625,22 @@ export class WorkflowService {
       },
     });
     if (!started) return;
+    const nativeTurnId = await started.nativeTurnId;
+    if (nativeTurnId) {
+      await this.transact(runId, (tx) => {
+        recordTurnStarted(tx, instanceId, turn.workflowTurnId, nativeTurnId);
+      });
+    }
     await this.completeTurn(runId, instanceId, await started.result);
   }
 
-  private async beginTurnIfAllowed(
+  private async startTurnIfAllowed(
     runId: string,
     instanceId: string,
     workflowTurnId: string,
     agentId: string,
-    request: Parameters<WorkflowRuntimeAdapter["beginTurn"]>[0],
-  ): Promise<WorkflowStartedTurn | null> {
+    request: Parameters<WorkflowRuntimeAdapter["startTurn"]>[0],
+  ): Promise<WorkflowTurnHandle | null> {
     return this.withLock(runId, async () => {
       const state = parseState(await this.storage.readState(runId));
       const instance = requireInstance(state, instanceId);
@@ -665,14 +671,7 @@ export class WorkflowService {
       role.status = "running";
       await this.commitTransaction(runId, tx);
 
-      const started = await this.adapter.beginTurn(request);
-      if (started.nativeTurnId) {
-        const startedState = parseState(await this.storage.readState(runId));
-        const startedTx: Transaction = { state: startedState, events: [] };
-        recordTurnStarted(startedTx, instanceId, workflowTurnId, started.nativeTurnId);
-        await this.commitTransaction(runId, startedTx);
-      }
-      return started;
+      return this.adapter.startTurn(request);
     });
   }
 

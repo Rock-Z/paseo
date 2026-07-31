@@ -33,6 +33,7 @@ interface SeedProjectDescriptor {
 export interface SeedDaemonClient {
   connect(): Promise<void>;
   close(): Promise<void>;
+  patchDaemonConfig(config: { mcp?: { injectIntoAgents?: boolean } }): Promise<unknown>;
   addProject(cwd: string): Promise<{
     project: {
       projectId: string;
