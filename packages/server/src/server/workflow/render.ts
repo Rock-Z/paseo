@@ -9,18 +9,22 @@ const IF_BLOCK = new RegExp(
   String.raw`\{%\s*if\s+(${VALUE_PATH})\s*==\s*(["'])(.*?)\2\s*%\}([\s\S]*?)\{%\s*endif\s*%\}`,
   "g",
 );
-const VALUE_EXPRESSION = new RegExp(String.raw`^${VALUE_PATH}\s*(?:\|\s*trim\s*)?$`);
+const VALUE_EXPRESSION = new RegExp(String.raw`^(${VALUE_PATH})\s*(?:\|\s*trim\s*)?$`);
 const ALL_VALUES = /\{\{([\s\S]*?)\}\}/g;
 const ANY_TAG = /{%\s*([^%]+?)\s*%}/;
 const ALL_TAGS = /{%\s*([^%]+?)\s*%}/g;
-const IF_TAG = new RegExp(String.raw`^if\s+${VALUE_PATH}\s*==\s*(["']).*?\1$`);
+const IF_TAG = new RegExp(String.raw`^if\s+(${VALUE_PATH})\s*==\s*(["']).*?\2$`);
 
 export function isExactValueExpression(value: unknown): value is string {
   return typeof value === "string" && EXACT_VALUE.test(value);
 }
 
-export function templateIssue(template: string, allowConditionals = false): string | null {
-  const interpolation = interpolationIssue(template);
+export function templateIssue(
+  template: string,
+  allowConditionals = false,
+  allowedRoots?: ReadonlySet<string>,
+): string | null {
+  const interpolation = interpolationIssue(template, allowedRoots);
   if (interpolation) return interpolation;
   const withoutValues = template.replace(ALL_VALUES, "");
   if (!allowConditionals) {
@@ -31,7 +35,10 @@ export function templateIssue(template: string, allowConditionals = false): stri
   let open = false;
   for (const match of withoutValues.matchAll(ALL_TAGS)) {
     const tag = match[1].trim();
-    if (IF_TAG.test(tag)) {
+    const conditional = tag.match(IF_TAG);
+    if (conditional) {
+      const root = rootIssue(conditional[1], allowedRoots);
+      if (root) return root;
       if (open) return "has an unsupported nested if block";
       open = true;
       continue;
@@ -113,14 +120,24 @@ function renderString(
   });
 }
 
-function interpolationIssue(template: string): string | null {
+function interpolationIssue(template: string, allowedRoots?: ReadonlySet<string>): string | null {
   for (const match of template.matchAll(ALL_VALUES)) {
     const expression = match[1].trim();
-    if (!VALUE_EXPRESSION.test(expression)) {
+    const value = expression.match(VALUE_EXPRESSION);
+    if (!value) {
       return `has unsupported interpolation: ${expression}`;
     }
+    const root = rootIssue(value[1], allowedRoots);
+    if (root) return root;
   }
   return template.replace(ALL_VALUES, "").includes("{{") ? "has an unbalanced interpolation" : null;
+}
+
+function rootIssue(expression: string, allowedRoots?: ReadonlySet<string>): string | null {
+  const root = expression.split(".", 1)[0];
+  return allowedRoots && !allowedRoots.has(root)
+    ? `has unsupported workflow value root: ${root}`
+    : null;
 }
 
 function hasUnbalancedSyntax(value: string, open: string, close: string): boolean {

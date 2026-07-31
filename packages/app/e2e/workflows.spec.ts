@@ -236,6 +236,52 @@ test.describe("Native workflows", () => {
     }
   });
 
+  test("refreshes selected details when a terminal status shares the running timestamp", async ({
+    page,
+  }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-equal-timestamp-" });
+    const name = uniqueWorkflowName("equal-timestamp");
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 45_000 }));
+      const runId = await startWorkflow(workspace.client, {
+        workflowId: name,
+        workspaceId: workspace.workspaceId,
+      });
+      await waitForActiveTurn(workspace.client, runId);
+      const runningUpdatedAt = (await inspectRequired(workspace.client, runId)).run.updatedAt;
+      await transformWorkflowResponses(page, (message) =>
+        rewriteRunListTimestamp(message, runId, "complete", runningUpdatedAt),
+      );
+
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      const runCard = page.getByTestId(`workflow-run-${runId}`);
+      await expect(runCard.getByText("running", { exact: true })).toBeVisible({
+        timeout: 30_000,
+      });
+      await runCard.click();
+      const details = page.getByTestId("workflow-run-details");
+      await expect(details.getByText("running", { exact: true })).toBeVisible();
+
+      await waitForWorkflow(workspace.client, runId, ["complete"], 60_000);
+      await expect(runCard.getByText("complete", { exact: true })).toBeVisible({
+        timeout: 10_000,
+      });
+      await expect(details.getByText("complete", { exact: true })).toBeVisible({
+        timeout: 10_000,
+      });
+      await expect(page.getByTestId("workflow-run-stop")).toHaveCount(0);
+    } finally {
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
   test("keeps the latest definition selected and resets shared inputs when switching", async ({
     page,
   }) => {
@@ -396,6 +442,61 @@ test.describe("Native workflows", () => {
       await expect(page.getByTestId("workflows-action-success")).toContainText("Queued wfr_");
       const runId = await findRunId(workspace.client, name);
       await expect(waitForWorkflow(workspace.client, runId, ["complete"])).resolves.toMatchObject({
+        run: { id: runId },
+      });
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("submits one run mutation for a rapid double resume", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-resume-lock-" });
+    const name = uniqueWorkflowName("resume-lock");
+    let resumeResponses = 0;
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildTwoTurnWorkflow({ name, delayMs: 3_000 }));
+      const runId = await startWorkflow(workspace.client, {
+        workflowId: name,
+        workspaceId: workspace.workspaceId,
+      });
+      await waitForActiveTurn(workspace.client, runId);
+      const stop = await workspace.client.workflowRunStop(runId);
+      expect(stop.error).toBeNull();
+      await waitForWorkflow(workspace.client, runId, ["stopped"], 30_000);
+
+      gate = await delayWorkflowResponse(page, isWorkflowRunResumeResponse, {
+        onServerMessage: (message) => {
+          if (isWorkflowRunResumeResponse(message)) resumeResponses += 1;
+        },
+      });
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await page.getByTestId(`workflow-run-${runId}`).click();
+      const resume = page.getByTestId("workflow-run-resume");
+      await expect(resume).toBeEnabled();
+      await resume.evaluate((element) => {
+        const button = element as HTMLButtonElement;
+        button.click();
+        button.click();
+      });
+      await gate.waitForDelayedResponse();
+      await page.waitForTimeout(250);
+
+      expect(resumeResponses).toBe(1);
+      await expect(resume).toBeDisabled();
+      gate.release();
+      await expect(page.getByTestId("workflows-action-success")).toContainText("Workflow resumed");
+      await expect(
+        waitForWorkflow(workspace.client, runId, ["complete"], 30_000),
+      ).resolves.toMatchObject({
         run: { id: runId },
       });
     } finally {
@@ -868,6 +969,66 @@ function isWorkflowRunStartResponse(message: string | Buffer): boolean {
     return envelope.type === "session" && envelope.message?.type === "workflow.run.start.response";
   } catch {
     return false;
+  }
+}
+
+function isWorkflowRunResumeResponse(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return envelope.type === "session" && envelope.message?.type === "workflow.run.resume.response";
+  } catch {
+    return false;
+  }
+}
+
+async function transformWorkflowResponses(
+  page: Page,
+  transform: (message: string | Buffer) => string | Buffer,
+): Promise<void> {
+  await page.routeWebSocket(daemonWsRoutePattern(), (ws) => {
+    const server = ws.connectToServer();
+    ws.onMessage((message) => server.send(message));
+    server.onMessage((message) => ws.send(transform(message)));
+  });
+}
+
+function rewriteRunListTimestamp(
+  message: string | Buffer,
+  runId: string,
+  status: string,
+  updatedAt: string,
+): string | Buffer {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: {
+        type?: unknown;
+        payload?: { runs?: Array<{ id?: unknown; status?: unknown; updatedAt?: unknown }> };
+      };
+    };
+    if (
+      envelope.type !== "session" ||
+      envelope.message?.type !== "workflow.run.list.response" ||
+      !Array.isArray(envelope.message.payload?.runs)
+    ) {
+      return message;
+    }
+    const run = envelope.message.payload.runs.find(
+      (candidate) => candidate.id === runId && candidate.status === status,
+    );
+    if (!run) return message;
+    run.updatedAt = updatedAt;
+    const rewritten = JSON.stringify(envelope);
+    return typeof message === "string" ? rewritten : Buffer.from(rewritten);
+  } catch {
+    return message;
   }
 }
 

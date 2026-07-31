@@ -51,6 +51,20 @@ const PARAMETER_TYPES = new Set([
 const DEFAULT_FROM = new Set(["current.workspace", "current.worktree", "current.agent"]);
 const CONTEXT_DEFAULT_PARAMETER_TYPES = new Set(["string", "path", "image", "enum"]);
 const PROTOTYPE_SENSITIVE_NAMES = new Set(["__proto__", "constructor", "prototype"]);
+const WORKFLOW_VALUE_ROOTS = new Set([
+  "parameters",
+  "inputs",
+  "objective",
+  "event",
+  "loop",
+  "budget",
+  "workspace",
+  "agents",
+  "groups",
+  "instance",
+  "task",
+  "item",
+]);
 const SLUG = /^[a-z0-9][a-z0-9-]*$/;
 const AGENT_NAME = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -126,7 +140,7 @@ function validateWorkflow(
   }
 
   const parameters = validateParameters(value.parameters, issues);
-  validateTemplateExpressions(value, parameters, issues);
+  validateTemplateExpressions(value, parameters, templateRoots(value.flows), issues);
   const agents = validateAgents(value.agents, issues);
   validateBindings(value.bindings, agents, issues);
   validateWorkspace(value.workspace, "workspace", parameters, issues);
@@ -269,10 +283,11 @@ function validateParameters(value: unknown, issues: Issues): Map<string, JsonObj
 function validateTemplateExpressions(
   value: unknown,
   parameters: ReadonlyMap<string, JsonObject>,
+  roots: ReadonlySet<string>,
   issues: Issues,
 ): void {
   const found = new Set<string>();
-  collectTemplateExpressions(value, "", found, issues);
+  collectTemplateExpressions(value, "", found, roots, issues);
   for (const name of [...found].sort()) {
     if (!parameters.has(name)) {
       issues.add(`parameters.${name}`, "referenced but not declared");
@@ -284,10 +299,11 @@ function collectTemplateExpressions(
   value: unknown,
   path: string,
   found: Set<string>,
+  roots: ReadonlySet<string>,
   issues: Issues,
 ): void {
   if (typeof value === "string") {
-    const issue = templateIssue(value, path.startsWith("prompts."));
+    const issue = templateIssue(value, path.startsWith("prompts."), roots);
     if (issue) issues.add(path || "$", issue);
     for (const expression of value.matchAll(TEMPLATE_EXPRESSION)) {
       const match = (expression[1] ?? expression[2] ?? "").match(PARAMETER_REFERENCE);
@@ -297,7 +313,7 @@ function collectTemplateExpressions(
   }
   if (Array.isArray(value)) {
     for (const [index, item] of value.entries()) {
-      collectTemplateExpressions(item, `${path}[${index}]`, found, issues);
+      collectTemplateExpressions(item, `${path}[${index}]`, found, roots, issues);
     }
     return;
   }
@@ -308,8 +324,23 @@ function collectTemplateExpressions(
     if (!path && key === "parameters") {
       continue;
     }
-    collectTemplateExpressions(item, path ? `${path}.${key}` : key, found, issues);
+    collectTemplateExpressions(item, path ? `${path}.${key}` : key, found, roots, issues);
   }
+}
+
+function templateRoots(flows: unknown): ReadonlySet<string> {
+  const roots = new Set(WORKFLOW_VALUE_ROOTS);
+  if (!isObject(flows)) return roots;
+  for (const flow of Object.values(flows)) {
+    if (!isObject(flow) || !isObject(flow.states)) continue;
+    for (const state of Object.values(flow.states)) {
+      if (!isObject(state) || !isObject(state.map)) continue;
+      if (typeof state.map.as === "string" && IDENTIFIER.test(state.map.as)) {
+        roots.add(state.map.as);
+      }
+    }
+  }
+  return roots;
 }
 
 function validateBindings(

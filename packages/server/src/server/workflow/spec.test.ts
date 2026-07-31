@@ -377,6 +377,18 @@ describe("workflow spec validation and materialization", () => {
     },
   );
 
+  it("rejects a template root the runtime never defines", () => {
+    const spec = baseSpec();
+    (spec.prompts as Record<string, unknown>).work = "{{ missing.value }}";
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "prompts.work",
+      message: "has unsupported workflow value root: missing",
+    });
+  });
+
   it("rejects recursive flow calls", () => {
     const spec = baseSpec();
     spec.flows = {

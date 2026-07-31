@@ -133,6 +133,7 @@ function WorkflowHostScreen({
   const [editorSavePending, setEditorSavePending] = useState(false);
   const editorSavePendingRef = useRef(false);
   const launchPendingRef = useRef(false);
+  const runMutationPendingRef = useRef(false);
   const loadRequestRef = useRef(0);
   const selectedRunIdRef = useRef<string | null>(null);
   const detailsRequestRef = useRef(0);
@@ -225,7 +226,13 @@ function WorkflowHostScreen({
   useEffect(() => {
     if (!details) return;
     const summary = runs.find((run) => run.id === details.run.id);
-    if (!summary || summary.updatedAt <= details.run.updatedAt) return;
+    if (
+      !summary ||
+      summary.updatedAt < details.run.updatedAt ||
+      (summary.updatedAt === details.run.updatedAt && summary.status === details.run.status)
+    ) {
+      return;
+    }
     const becameTerminal =
       ACTIVE_STATUSES.has(details.run.status) && !ACTIVE_STATUSES.has(summary.status);
     setDetails((current) =>
@@ -349,7 +356,8 @@ function WorkflowHostScreen({
 
   const mutateRun = useCallback(
     async (kind: "stop" | "resume") => {
-      if (!client || !details) return;
+      if (!client || !details || runMutationPendingRef.current) return;
+      runMutationPendingRef.current = true;
       setAction({
         kind: "pending",
         message: kind === "stop" ? "Requesting graceful stop…" : "Resuming workflow…",
@@ -368,6 +376,8 @@ function WorkflowHostScreen({
         await refreshDetails(details.run.id);
       } catch (error) {
         setAction({ kind: "error", message: errorMessage(error) });
+      } finally {
+        runMutationPendingRef.current = false;
       }
     },
     [client, details, load, refreshDetails],
