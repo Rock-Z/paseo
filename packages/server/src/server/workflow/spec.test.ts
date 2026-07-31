@@ -193,6 +193,9 @@ describe("workflow spec validation and materialization", () => {
     const turn = states.work.turn as Record<string, unknown>;
     const emits = turn.emits as Record<string, Record<string, unknown>>;
     emits.done.dataSchema = { type: "definitely-not-a-json-schema-type" };
+    const agents = spec.agents as Record<string, Record<string, Record<string, unknown>>>;
+    agents.worker.createAgent.modle = "typo-model";
+    (agents.worker.createAgent.settings as Record<string, unknown>).thniking = "high";
     (spec.inputs as Record<string, unknown>).missing = "{{ parameters.notDeclared }}";
     const workspace = spec.workspace as Record<string, Record<string, unknown>>;
     workspace.createWorktree.prefix = "ignored-prefix";
@@ -203,6 +206,8 @@ describe("workflow spec validation and materialization", () => {
       expect.arrayContaining([
         "$.unexpected",
         "workspace.createWorktree.prefix",
+        "agents.worker.createAgent.modle",
+        "agents.worker.createAgent.settings.thniking",
         "parameters.notDeclared",
         "flows.main.states.work.on.done",
         "flows.main.states.work.turn.emits.done.dataSchema",

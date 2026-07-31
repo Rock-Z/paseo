@@ -401,6 +401,7 @@ function validateAgentDeclaration(declaration: JsonObject, path: string, issues:
 }
 
 function validateCreateAgent(create: JsonObject, path: string, issues: Issues): void {
+  issues.unknown(create, path, new Set(["title", "provider", "model", "settings"]));
   for (const field of ["title", "provider", "settings"]) {
     if (!(field in create)) {
       issues.add(`${path}.${field}`, "required");
@@ -424,7 +425,13 @@ function validateCreateAgent(create: JsonObject, path: string, issues: Issues): 
   }
   if (!isObject(create.settings)) {
     issues.add(`${path}.settings`, "must be an object");
+    return;
   }
+  issues.unknown(
+    create.settings,
+    `${path}.settings`,
+    new Set(["mode", "modeId", "thinking", "thinkingOptionId", "featureValues"]),
+  );
 }
 
 function validatePrompts(value: unknown, issues: Issues): void {

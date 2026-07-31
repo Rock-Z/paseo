@@ -9,6 +9,7 @@ import { type IsolatedHostDaemon, startIsolatedHostDaemon } from "./helpers/isol
 import { connectSeedClient, seedWorkspace, type SeedDaemonClient } from "./helpers/seed-client";
 import { getServerId } from "./helpers/server-id";
 import { createTempGitRepo } from "./helpers/workspace";
+import { daemonWsRoutePattern } from "./helpers/daemon-port";
 import {
   buildFanoutWorkflow,
   buildSingleTurnWorkflow,
@@ -90,6 +91,50 @@ test.describe("Native workflows", () => {
       await expect(page).toHaveURL(/\/workspace\//);
       await expect(page).not.toHaveURL(/\/workflows/);
     } finally {
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
+  test("keeps the latest run selected when an older inspection arrives late", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-selection-" });
+    const name = uniqueWorkflowName("selection");
+    let gate: WorkflowInspectResponseGate | null = null;
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 0 }));
+      const firstRunId = await startWorkflow(workspace.client, {
+        workflowId: name,
+        workspaceId: workspace.workspaceId,
+      });
+      await waitForWorkflow(workspace.client, firstRunId, ["complete"]);
+      const secondRunId = await startWorkflow(workspace.client, {
+        workflowId: name,
+        workspaceId: workspace.workspaceId,
+      });
+      await waitForWorkflow(workspace.client, secondRunId, ["complete"]);
+
+      gate = await delayWorkflowInspectResponse(page, firstRunId);
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByTestId(`workflow-run-${firstRunId}`)).toBeVisible({
+        timeout: 30_000,
+      });
+      await page.getByTestId(`workflow-run-${firstRunId}`).click();
+      await gate.waitForDelayedResponse();
+      await page.getByTestId(`workflow-run-${secondRunId}`).click();
+      await expect(page.getByTestId("workflow-run-details")).toContainText(secondRunId);
+
+      gate.release();
+      await flushBrowserFrames(page);
+      await expect(page.getByTestId("workflow-run-details")).toContainText(secondRunId);
+      await expect(page.getByTestId("workflow-run-details")).not.toContainText(firstRunId);
+    } finally {
+      gate?.release();
       await page.goto("about:blank").catch(() => undefined);
       await workspace.cleanup();
     }
@@ -462,4 +507,78 @@ interface WorkflowTimelineClient {
       };
     }>;
   }>;
+}
+
+interface WorkflowInspectResponseGate {
+  release(): void;
+  waitForDelayedResponse(): Promise<void>;
+}
+
+async function delayWorkflowInspectResponse(
+  page: Page,
+  runId: string,
+): Promise<WorkflowInspectResponseGate> {
+  let releaseRequested = false;
+  let delayedResponseSeen = false;
+  const delayedForwards: Array<() => void> = [];
+  let resolveDelayedResponse!: () => void;
+  const delayedResponse = new Promise<void>((resolve) => {
+    resolveDelayedResponse = resolve;
+  });
+
+  await page.routeWebSocket(daemonWsRoutePattern(), (ws) => {
+    const server = ws.connectToServer();
+    ws.onMessage((message) => server.send(message));
+    server.onMessage((message) => {
+      if (!delayedResponseSeen && workflowInspectResponseRunId(message) === runId) {
+        delayedResponseSeen = true;
+        resolveDelayedResponse();
+        if (releaseRequested) {
+          ws.send(message);
+          return;
+        }
+        delayedForwards.push(() => ws.send(message));
+        return;
+      }
+      ws.send(message);
+    });
+  });
+
+  return {
+    release() {
+      releaseRequested = true;
+      for (const forward of delayedForwards.splice(0)) forward();
+    },
+    waitForDelayedResponse: () => delayedResponse,
+  };
+}
+
+function workflowInspectResponseRunId(message: string | Buffer): string | null {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: {
+        type?: unknown;
+        payload?: { details?: { run?: { id?: unknown } } };
+      };
+    };
+    const id =
+      envelope.type === "session" && envelope.message?.type === "workflow.run.inspect.response"
+        ? envelope.message.payload?.details?.run?.id
+        : null;
+    return typeof id === "string" ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+async function flushBrowserFrames(page: Page): Promise<void> {
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      }),
+  );
 }

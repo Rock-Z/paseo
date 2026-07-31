@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { router, useLocalSearchParams } from "expo-router";
 import { Play, Plus, RefreshCw, RotateCcw, Square } from "lucide-react-native";
 import { Pressable, ScrollView, Text, View } from "react-native";
@@ -19,7 +19,7 @@ import { Field, FormTextInput } from "@/components/ui/form-field";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { useHostFeature } from "@/runtime/host-features";
-import { getHostRuntimeStore, useHosts } from "@/runtime/host-runtime";
+import { useHostRuntimeClient, useHosts } from "@/runtime/host-runtime";
 import { buildHostAgentDetailRoute, buildHostWorkspaceRoute } from "@/utils/host-routes";
 import {
   openWorkflowLaunchForm,
@@ -129,8 +129,9 @@ function WorkflowHostScreen({
   const [action, setAction] = useState<ActionStatus>({ kind: "idle" });
   const [editorOpen, setEditorOpen] = useState(false);
   const [editor, setEditor] = useState("");
+  const selectedRunIdRef = useRef<string | null>(null);
 
-  const client = getHostRuntimeStore().getClient(serverId);
+  const client = useHostRuntimeClient(serverId);
 
   const load = useCallback(
     async (quiet = false) => {
@@ -162,19 +163,24 @@ function WorkflowHostScreen({
   const refreshDetails = useCallback(
     async (runId: string) => {
       if (!client) {
-        setAction({
-          kind: "error",
-          message: "The host is disconnected. Reconnect, then try again.",
-        });
+        if (selectedRunIdRef.current === runId) {
+          setAction({
+            kind: "error",
+            message: "The host is disconnected. Reconnect, then try again.",
+          });
+        }
         return false;
       }
       try {
         const payload = await client.workflowRunInspect(runId);
+        if (selectedRunIdRef.current !== runId) return false;
         if (payload.error) throw new Error(payload.error);
         if (payload.details) setDetails(payload.details);
         return true;
       } catch (error) {
-        setAction({ kind: "error", message: errorMessage(error) });
+        if (selectedRunIdRef.current === runId) {
+          setAction({ kind: "error", message: errorMessage(error) });
+        }
         return false;
       }
     },
@@ -182,6 +188,7 @@ function WorkflowHostScreen({
   );
 
   useEffect(() => {
+    selectedRunIdRef.current = null;
     setDetails(null);
     setSelectedSpec(null);
     setValidation(null);
@@ -238,6 +245,7 @@ function WorkflowHostScreen({
       setAction({ kind: "success", message: `Queued ${payload.run.id}` });
       setSelectedSpec(null);
       setValidation(null);
+      selectedRunIdRef.current = payload.run.id;
       setDetails(null);
       await load(true);
       await refreshDetails(payload.run.id);
@@ -283,6 +291,8 @@ function WorkflowHostScreen({
 
   const inspect = useCallback(
     async (run: WorkflowRunSummary) => {
+      selectedRunIdRef.current = run.id;
+      setDetails(null);
       setAction({ kind: "pending", message: `Loading ${run.id}…` });
       if (await refreshDetails(run.id)) setAction({ kind: "idle" });
     },
