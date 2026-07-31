@@ -42,7 +42,8 @@ export function submitWorkflowLaunchForm(
       continue;
     }
     try {
-      parameters[declaration.name] = parseParameterValue(raw, declaration);
+      parameters[declaration.name] =
+        raw === "null" && !declaration.required ? null : parseParameterValue(raw, declaration);
     } catch (error) {
       errors[declaration.name] = error instanceof Error ? error.message : String(error);
     }

@@ -750,11 +750,12 @@ export class WorkflowService {
       const instance = requireInstance(tx.state, instanceId);
       const turn = instance.activeTurn;
       if (!turn) return;
-      if (turn.agentId && result.agentId && turn.agentId !== result.agentId) {
-        failState(tx, "active_turn_identity_mismatch");
-        return;
-      }
-      if (turn.nativeTurnId && result.nativeTurnId && turn.nativeTurnId !== result.nativeTurnId) {
+      const identityMismatch =
+        (turn.agentId && result.agentId && turn.agentId !== result.agentId) ||
+        (turn.nativeTurnId && result.nativeTurnId && turn.nativeTurnId !== result.nativeTurnId);
+      if (identityMismatch) {
+        requireRole(instance, turn.agent).status = "failed";
+        instance.activeTurn = null;
         failState(tx, "active_turn_identity_mismatch");
         return;
       }
@@ -1287,7 +1288,7 @@ function requestTerminal(
 }
 
 function finalizeRequestedStop(tx: Transaction): void {
-  if (!tx.state.stopRequested || hasActiveTurns(tx.state)) return;
+  if (isTerminal(tx.state.status) || !tx.state.stopRequested || hasActiveTurns(tx.state)) return;
   const pending = tx.state.pendingTerminal;
   if (pending) {
     completeState(tx, pending.status, pending.reason);
@@ -1319,7 +1320,7 @@ function terminalEventType(status: "complete" | "stopped" | "failed"): string {
 }
 
 function failState(tx: Transaction, reason: string): void {
-  completeState(tx, "failed", reason);
+  requestTerminal(tx, "failed", reason);
 }
 
 function buildContext(

@@ -38,6 +38,7 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
   validateGate: Promise<void> = Promise.resolve();
   idleGate: Promise<void> = Promise.resolve();
   pauseAfterNativeSubmission = false;
+  workspaceFailure: { instanceId: string; afterStarts: number; message: string } | null = null;
   concurrentStartRejections = 0;
   maxActive = 0;
   private active = new Map<string, PendingTurn>();
@@ -68,6 +69,10 @@ class FakeRuntimeAdapter implements WorkflowRuntimeAdapter {
     create: JsonObject;
   }): Promise<WorkflowWorkspace> {
     this.workspaceCreates.push(input.instanceId);
+    if (this.workspaceFailure?.instanceId === input.instanceId) {
+      await this.waitForStarts(this.workspaceFailure.afterStarts);
+      throw new Error(this.workspaceFailure.message);
+    }
     return {
       workspaceId: `workspace-${input.instanceId}`,
       cwd: String(input.create.cwd ?? "/repo"),
@@ -262,6 +267,21 @@ async function waitForRunTerminal(
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`timed out waiting for workflow run ${runId}`);
+}
+
+async function waitForRunStatus(
+  service: WorkflowService,
+  runId: string,
+  statuses: string[],
+  timeoutMs = 10_000,
+): Promise<WorkflowRunSummary> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const run = await service.inspectRun(runId);
+    if (statuses.includes(run.run.status)) return run.run;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for workflow run ${runId} status ${statuses.join(", ")}`);
 }
 
 async function waitForActiveTurnPhase(
@@ -890,6 +910,105 @@ describe("WorkflowService runtime", () => {
       { index: 1, output: "SECOND" },
       { index: 2, output: "THIRD" },
     ]);
+  });
+
+  it("drains active map turns before finalizing a provisioning failure", async () => {
+    const workflow = baseSpec();
+    workflow.inputs = { items: ["active", "provisioning-error"] };
+    workflow.flows = {
+      main: {
+        initial: "fanout",
+        states: {
+          fanout: {
+            map: {
+              group: "items",
+              items: "{{ inputs.items }}",
+              as: "item",
+              call: {
+                flow: "child",
+                with: { value: "{{ item }}" },
+                workspace: {
+                  createWorktree: {
+                    cwd: "/repo",
+                    target: { mode: "branch-off", base: "main" },
+                  },
+                },
+              },
+              join: "all",
+              concurrency: 2,
+            },
+            on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+          },
+          finish: { return: { output: "{{ event.data.results }}" } },
+          failed: { stop: { reason: "{{ event.message }}" } },
+        },
+      },
+      child: {
+        initial: "work",
+        inputs: { value: "" },
+        states: {
+          work: {
+            turn: {
+              agent: "worker",
+              prompt: "child",
+              emits: { done: { description: "Child completed" } },
+            },
+            on: { done: "finish", "error.agent": "failed", "error.protocol": "failed" },
+          },
+          finish: { return: { output: "{{ inputs.value }}" } },
+          failed: { stop: { reason: "{{ event.message }}" } },
+        },
+      },
+    };
+    (workflow.prompts as JsonObject).child = "Process {{ inputs.value }}.";
+    const { service, storage, adapter } = await setup(workflow);
+    adapter.workspaceFailure = {
+      instanceId: "i2",
+      afterStarts: 1,
+      message: "controlled provisioning failure",
+    };
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "unused" },
+      context: { workspaceId: "workspace-root" },
+    });
+
+    await adapter.waitForStarts(1);
+    await expect(waitForRunStatus(service, run.id, ["stopping", "failed"])).resolves.toMatchObject({
+      status: "stopping",
+      reason: "controlled provisioning failure",
+    });
+    const draining = await service.inspectRun(run.id);
+    expect(draining.state).toMatchObject({
+      pendingTerminal: { status: "failed", reason: "controlled provisioning failure" },
+    });
+    expect(draining.events.filter((event) => event.type === "run_failed")).toHaveLength(0);
+
+    const active = adapter.starts[0];
+    service.dispose();
+    const restartedAdapter = new FakeRuntimeAdapter();
+    restartedAdapter.adopt(active.request, active.nativeTurnId);
+    const restartedService = new WorkflowService({ storage, adapter: restartedAdapter });
+    await restartedService.initialize();
+    await restartedService.start();
+    await restartedAdapter.waitForReconciliations(1);
+    await restartedService.emitEvent({
+      callerAgentId: active.request.agentId,
+      event: "done",
+      message: "drained after sibling failure",
+    });
+    restartedAdapter.complete(active.request.agentId);
+
+    await expect(waitForRunTerminal(restartedService, run.id)).resolves.toMatchObject({
+      status: "failed",
+      reason: "controlled provisioning failure",
+    });
+    const failed = await restartedService.inspectRun(run.id);
+    expect(failed.events.filter((event) => event.type === "event_accepted")).toHaveLength(1);
+    expect(failed.events.filter((event) => event.type === "run_failed")).toHaveLength(1);
+    expect(failed.events.filter((event) => event.type === "run_stopped")).toHaveLength(0);
+    expect(adapter.starts).toHaveLength(1);
+    expect(restartedAdapter.starts).toHaveLength(0);
   });
 
   it("drains active turns on stop, launches nothing new, then resumes remaining map work", async () => {

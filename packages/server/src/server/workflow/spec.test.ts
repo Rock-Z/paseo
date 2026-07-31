@@ -262,6 +262,20 @@ describe("workflow spec validation and materialization", () => {
     );
   });
 
+  it.each([null, 1, {}, [], ""])("rejects createWorktree name value %j", (value) => {
+    const spec = baseSpec();
+    const workspace = spec.workspace as Record<string, Record<string, unknown>>;
+    workspace.createWorktree.name = value;
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual(
+      expect.objectContaining({
+        path: "workspace.createWorktree.name",
+      }),
+    );
+  });
+
   it("validates every action and ordered bounded map declaration", () => {
     const spec = baseSpec();
     const flows = spec.flows as Record<string, Record<string, unknown>>;

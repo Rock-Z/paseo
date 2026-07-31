@@ -347,6 +347,9 @@ function validateWorkspace(value: unknown, path: string, issues: Issues): void {
   if (typeof create.cwd !== "string" || create.cwd.length === 0) {
     issues.add(`${createPath}.cwd`, "must be a string");
   }
+  if ("name" in create && (typeof create.name !== "string" || create.name.length === 0)) {
+    issues.add(`${createPath}.name`, "must be a non-empty string");
+  }
   if (!issues.object(create.target, `${createPath}.target`)) {
     return;
   }

@@ -45,6 +45,50 @@ describe("workflow launch form model", () => {
     });
   });
 
+  it("submits explicit null for optional caller bindings", () => {
+    const bindingValidation: WorkflowValidationResult = {
+      valid: true,
+      issues: [],
+      summary: null,
+      parameters: [
+        {
+          name: "workspaceRef",
+          type: "string",
+          description: "Existing workspace",
+          required: false,
+          defaultFrom: "current.workspace",
+        },
+        {
+          name: "worktreeRef",
+          type: "path",
+          description: "Existing worktree",
+          required: false,
+          defaultFrom: "current.worktree",
+        },
+        {
+          name: "workerThreadRef",
+          type: "string",
+          description: "Existing worker",
+          required: false,
+          defaultFrom: "current.agent",
+        },
+      ],
+    };
+    let form = openWorkflowLaunchForm(bindingValidation);
+    for (const name of ["workspaceRef", "worktreeRef", "workerThreadRef"]) {
+      form = updateWorkflowLaunchValue(form, name, "null");
+    }
+
+    expect(submitWorkflowLaunchForm(form, bindingValidation)).toEqual({
+      ok: true,
+      parameters: {
+        workspaceRef: null,
+        worktreeRef: null,
+        workerThreadRef: null,
+      },
+    });
+  });
+
   it("returns field errors without discarding entered values", () => {
     let form = openWorkflowLaunchForm(validation);
     form = updateWorkflowLaunchValue(form, "concurrency", "many");
