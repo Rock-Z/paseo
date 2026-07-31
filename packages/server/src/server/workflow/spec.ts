@@ -102,6 +102,14 @@ export function validateWorkflowTemplate(
   value: unknown,
   source: "built-in" | "user" | "legacy" = "user",
 ): WorkflowValidationResult {
+  return validateWorkflow(value, source, false);
+}
+
+function validateWorkflow(
+  value: unknown,
+  source: "built-in" | "user" | "legacy",
+  allowMaterializedMapItems: boolean,
+): WorkflowValidationResult {
   const issues = new Issues();
   if (!issues.object(value, "$")) {
     return validationResult(issues, null);
@@ -128,7 +136,15 @@ export function validateWorkflowTemplate(
   if (value.inputs !== undefined && !isObject(value.inputs)) {
     issues.add("inputs", "must be an object");
   }
-  validateFlows(value.flows, value.entry, agents, value.prompts, parameters, issues);
+  validateFlows(
+    value.flows,
+    value.entry,
+    agents,
+    value.prompts,
+    parameters,
+    allowMaterializedMapItems,
+    issues,
+  );
 
   const summary =
     typeof value.name === "string" &&
@@ -538,6 +554,7 @@ function validateFlows(
   agents: ReadonlyMap<string, JsonObject>,
   prompts: unknown,
   parameters: ReadonlyMap<string, JsonObject>,
+  allowMaterializedMapItems: boolean,
   issues: Issues,
 ): void {
   if (!issues.object(value, "flows") || Object.keys(value).length === 0) {
@@ -575,6 +592,7 @@ function validateFlows(
         agents,
         promptNames,
         parameters,
+        allowMaterializedMapItems,
         issues,
       );
     }
@@ -753,6 +771,7 @@ function validateState(
   agents: ReadonlyMap<string, JsonObject>,
   promptNames: ReadonlySet<string>,
   parameters: ReadonlyMap<string, JsonObject>,
+  allowMaterializedMapItems: boolean,
   issues: Issues,
 ): void {
   if (!issues.object(value, path)) {
@@ -776,7 +795,7 @@ function validateState(
     }
     validateAllowedRoutes(routes, new Set([...RUNTIME_EVENTS, "returned"]), path, issues);
   } else if (action === "map") {
-    validateMap(value.map, `${path}.map`, flowNames, parameters, issues);
+    validateMap(value.map, `${path}.map`, flowNames, parameters, allowMaterializedMapItems, issues);
     if (!routes.has("joined")) {
       issues.add(`${path}.on.joined`, "required");
     }
@@ -962,6 +981,7 @@ function validateMap(
   path: string,
   flowNames: ReadonlySet<string>,
   parameters: ReadonlyMap<string, JsonObject>,
+  allowMaterializedItems: boolean,
   issues: Issues,
 ): void {
   if (!issues.object(value, path)) {
@@ -973,9 +993,10 @@ function validateMap(
   } else if (PROTOTYPE_SENSITIVE_NAMES.has(value.group)) {
     issues.add(`${path}.group`, "must not be a prototype-sensitive name");
   }
-  if (typeof value.items !== "string" || !value.items.trim()) {
+  const materializedArray = allowMaterializedItems && Array.isArray(value.items);
+  if (!materializedArray && (typeof value.items !== "string" || !value.items.trim())) {
     issues.add(`${path}.items`, "must be a non-empty string");
-  } else if (!isExactValueExpression(value.items)) {
+  } else if (!materializedArray && !isExactValueExpression(value.items)) {
     issues.add(`${path}.items`, "must be an exact value expression");
   }
   if (typeof value.as !== "string" || !IDENTIFIER.test(value.as)) {
@@ -1040,7 +1061,7 @@ export function materializeWorkflowSpec(
   if (!isObject(materialized)) {
     throw new Error("$: materialized spec must be an object");
   }
-  const materializedValidation = validateWorkflowTemplate(materialized);
+  const materializedValidation = validateWorkflow(materialized, "user", true);
   if (!materializedValidation.valid) {
     throw new Error(formatValidationIssues(materializedValidation.issues));
   }

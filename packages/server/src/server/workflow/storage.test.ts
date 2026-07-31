@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { canonicalJson } from "./json.js";
 import { type WorkflowCommitBoundary, WorkflowStorage } from "./storage.js";
 
 const roots: string[] = [];
@@ -227,6 +228,71 @@ describe("WorkflowStorage", () => {
       ).rejects.toMatchObject({ code: "ENOENT" });
     },
   );
+
+  it("recovers a partially appended audit suffix from the pending transaction", async () => {
+    const { storage, paseoHome, builtIns } = await makeStorage();
+    const now = "2026-07-30T00:00:00.000Z";
+    const initialState = {
+      schemaVersion: "paseo.workflows.run.v0.2",
+      runId: "partial-audit-run",
+      workflow: { id: "custom", name: "custom" },
+      status: "queued",
+      reason: null,
+      createdAt: now,
+      updatedAt: now,
+      startedAt: null,
+      completedAt: null,
+      loop: { iteration: 0, elapsedSeconds: 0 },
+      eventSeq: 1,
+      instances: {},
+    };
+    await storage.createRun("partial-audit-run", spec(), initialState, [
+      {
+        seq: 1,
+        timestamp: now,
+        type: "run_queued",
+        message: "x".repeat(128 * 1024),
+      },
+    ]);
+    const pendingEvents = [
+      { seq: 2, timestamp: now, type: "run_started" },
+      { seq: 3, timestamp: now, type: "event_accepted", event: "done" },
+    ];
+    const crashingStorage = new WorkflowStorage({
+      paseoHome,
+      builtInDirectory: builtIns,
+      commitBoundaryHook: (boundary) => {
+        if (boundary.step === "journal" && boundary.phase === "after") {
+          throw new Error("injected after journal");
+        }
+      },
+    });
+    await expect(
+      crashingStorage.commitRunTransaction("partial-audit-run", {
+        state: { ...initialState, status: "running", eventSeq: 3 },
+        events: pendingEvents,
+      }),
+    ).rejects.toThrow("injected after journal");
+
+    const auditPath = path.join(
+      paseoHome,
+      "workflows",
+      "runs",
+      "partial-audit-run",
+      "events.jsonl",
+    );
+    const finalRecord = `${canonicalJson(pendingEvents[1])}\n`;
+    await fs.appendFile(
+      auditPath,
+      `${canonicalJson(pendingEvents[0])}\n${finalRecord.slice(0, Math.floor(finalRecord.length / 2))}`,
+    );
+
+    const recovered = new WorkflowStorage({ paseoHome, builtInDirectory: builtIns });
+    await recovered.initialize();
+    const details = await recovered.inspectRun("partial-audit-run");
+    expect(details.state.eventSeq).toBe(3);
+    expect(details.events.map((event) => event.seq)).toEqual([1, 2, 3]);
+  });
 
   it("only exposes rendered prompts referenced by durable workflow state", async () => {
     const { storage } = await makeStorage();

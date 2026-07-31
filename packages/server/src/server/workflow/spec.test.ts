@@ -173,6 +173,52 @@ describe("workflow spec validation and materialization", () => {
     });
   });
 
+  it("materializes an array parameter into map items", () => {
+    const spec = baseSpec();
+    const parameters = spec.parameters as Record<string, unknown>;
+    parameters.branches = { type: "array", required: true };
+    const flows = spec.flows as Record<string, Record<string, unknown>>;
+    flows.child = {
+      initial: "finish",
+      inputs: {},
+      states: { finish: { return: { output: "{{ inputs.branch }}" } } },
+    };
+    const mainStates = flows.main.states as Record<string, unknown>;
+    mainStates.work = {
+      map: {
+        group: "branches",
+        items: "{{ parameters.branches }}",
+        as: "branch",
+        call: { flow: "child", with: { branch: "{{ branch }}" } },
+        join: "all",
+      },
+      on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+    };
+
+    const result = materializeWorkflowSpec(
+      spec,
+      {
+        objective: "Fan out",
+        branches: [{ id: "first" }, { id: "second" }],
+      },
+      { workspaceId: "workspace-1", worktreePath: "/repo/worktree" },
+    );
+
+    expect(result.spec).toMatchObject({
+      flows: {
+        main: {
+          states: {
+            work: {
+              map: {
+                items: [{ id: "first" }, { id: "second" }],
+              },
+            },
+          },
+        },
+      },
+    });
+  });
+
   it("rejects explicit null for a required parameter", () => {
     expect(() =>
       materializeWorkflowSpec(

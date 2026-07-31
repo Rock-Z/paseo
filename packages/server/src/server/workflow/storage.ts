@@ -330,17 +330,32 @@ export class WorkflowStorage {
     const statePath = path.join(directory, "state.json");
     await assertNotSymlink(eventsPath);
     await assertNotSymlink(statePath);
-    await repairPartialEventAppend(eventsPath, pending.events);
+    const auditTail = await readRecoverableAuditTail(eventsPath, pending.events);
+    const eventsBySequence = new Map(auditTail.map((event) => [event.seq, event]));
+    let auditSequence = auditTail.at(-1)?.seq ?? 0;
     for (const [index, event] of pending.events.entries()) {
       if (notifyBoundaries) {
         await this.reachCommitBoundary({ step: "event", phase: "before", index });
       }
-      await appendEventIdempotently(eventsPath, event);
+      const sameSequence = eventsBySequence.get(event.seq);
+      if (sameSequence) {
+        if (canonicalJson(sameSequence) !== canonicalJson(event)) {
+          throw new Error(`workflow audit event ${event.seq} conflicts with pending transaction`);
+        }
+      } else {
+        if (event.seq !== auditSequence + 1) {
+          throw new Error(
+            `workflow audit event ${event.seq} is not contiguous after ${auditSequence}`,
+          );
+        }
+        await appendCanonicalEvent(eventsPath, event);
+        eventsBySequence.set(event.seq, event);
+        auditSequence = event.seq;
+      }
       if (notifyBoundaries) {
         await this.reachCommitBoundary({ step: "event", phase: "after", index });
       }
     }
-    const auditSequence = (await readCanonicalEvents(eventsPath)).at(-1)?.seq ?? 0;
     if (pending.state.eventSeq !== auditSequence) {
       throw new Error(
         `workflow state event sequence ${String(pending.state.eventSeq)} does not match audit ${auditSequence}`,
@@ -583,54 +598,66 @@ function parsePendingCommit(value: unknown): PendingWorkflowCommit {
   };
 }
 
-async function repairPartialEventAppend(
+async function readRecoverableAuditTail(
   filePath: string,
   pendingEvents: WorkflowEventRecord[],
-): Promise<void> {
-  const text = await fs.readFile(filePath, "utf8");
-  if (!text || text.endsWith("\n")) return;
-  const lastNewline = text.lastIndexOf("\n");
-  const completeText = text.slice(0, lastNewline + 1);
-  const trailing = text.slice(lastNewline + 1);
-  const matchesPendingEvent = pendingEvents.some((event) =>
-    `${canonicalJson(event)}\n`.startsWith(trailing),
-  );
-  if (!matchesPendingEvent) {
-    throw new Error("workflow audit has a partial record outside the pending transaction");
-  }
-  await fs.truncate(filePath, Buffer.byteLength(completeText));
-}
-
-async function appendEventIdempotently(
-  filePath: string,
-  event: WorkflowEventRecord,
-): Promise<void> {
-  const existing = await readCanonicalEvents(filePath);
-  const sameSequence = existing.find((candidate) => candidate.seq === event.seq);
-  if (sameSequence) {
-    if (canonicalJson(sameSequence) !== canonicalJson(event)) {
-      throw new Error(`workflow audit event ${event.seq} conflicts with pending transaction`);
-    }
-    return;
-  }
-  const lastSequence = existing.at(-1)?.seq ?? 0;
-  if (event.seq !== lastSequence + 1) {
-    throw new Error(`workflow audit event ${event.seq} is not contiguous after ${lastSequence}`);
-  }
-  const handle = await fs.open(filePath, "a");
+): Promise<WorkflowEventRecord[]> {
+  const handle = await fs.open(filePath, "r");
+  let fileSize = 0;
+  let start = 0;
+  const chunks: Buffer[] = [];
   try {
-    await handle.write(`${canonicalJson(event)}\n`);
-    await handle.sync();
+    fileSize = (await handle.stat()).size;
+    start = fileSize;
+    const requiredRecords = Math.max(1, pendingEvents.length + 1);
+    let newlineCount = 0;
+    while (start > 0 && newlineCount <= requiredRecords) {
+      const length = Math.min(64 * 1024, start);
+      start -= length;
+      const chunk = Buffer.allocUnsafe(length);
+      let offset = 0;
+      while (offset < length) {
+        const { bytesRead } = await handle.read(chunk, offset, length - offset, start + offset);
+        if (bytesRead === 0) throw new Error("workflow audit ended during tail read");
+        offset += bytesRead;
+      }
+      const value = chunk.subarray(0, offset);
+      for (const byte of value) {
+        if (byte === 0x0a) newlineCount += 1;
+      }
+      chunks.push(value);
+    }
   } finally {
     await handle.close();
   }
-}
 
-async function readCanonicalEvents(filePath: string): Promise<WorkflowEventRecord[]> {
-  const text = await fs.readFile(filePath, "utf8");
-  const events = text
+  let buffer = Buffer.concat(chunks.toReversed());
+  if (start > 0) {
+    const firstNewline = buffer.indexOf(0x0a);
+    if (firstNewline < 0) {
+      throw new Error("workflow audit tail does not contain a complete record");
+    }
+    buffer = buffer.subarray(firstNewline + 1);
+  }
+  if (buffer.length > 0 && buffer.at(-1) !== 0x0a) {
+    const lastNewline = buffer.lastIndexOf(0x0a);
+    const trailing = buffer.subarray(lastNewline + 1);
+    const trailingText = trailing.toString("utf8");
+    const matchesPendingEvent = pendingEvents.some((event) =>
+      `${canonicalJson(event)}\n`.startsWith(trailingText),
+    );
+    if (!matchesPendingEvent) {
+      throw new Error("workflow audit has a partial record outside the pending transaction");
+    }
+    await fs.truncate(filePath, fileSize - trailing.length);
+    buffer = buffer.subarray(0, lastNewline + 1);
+  }
+
+  const events = buffer
+    .toString("utf8")
     .split("\n")
     .filter(Boolean)
+    .slice(-(pendingEvents.length + 1))
     .map((line) => WorkflowEventRecordSchema.parse(JSON.parse(line) as unknown));
   for (let index = 1; index < events.length; index += 1) {
     if (events[index]!.seq <= events[index - 1]!.seq) {
@@ -638,6 +665,16 @@ async function readCanonicalEvents(filePath: string): Promise<WorkflowEventRecor
     }
   }
   return events;
+}
+
+async function appendCanonicalEvent(filePath: string, event: WorkflowEventRecord): Promise<void> {
+  const handle = await fs.open(filePath, "a");
+  try {
+    await handle.writeFile(`${canonicalJson(event)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 async function readJsonObject(filePath: string, label: string): Promise<JsonObject> {

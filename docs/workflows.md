@@ -83,8 +83,9 @@ $PASEO_HOME/workflows/
 `spec.json` is the fully materialized canonical JSON used by that run. Each state transition and its
 audit events commit through one per-run journal. Recovery finishes a journal idempotently before
 exposing the run, then removes it. `state.json` is replaced atomically and `events.jsonl` remains
-append-only. The state and audit log retain accepted events, rendered prompt references, active and
-completed turn identities, and agent and workspace control targets.
+append-only. Commit and recovery validate only the audit tail that can overlap the journal, then
+append its missing contiguous suffix. The state and audit log retain accepted events, rendered
+prompt references, active and completed turn identities, and agent and workspace control targets.
 
 After daemon listen and agent tool setup complete, `WorkflowService` loads non-terminal intent and
 reconciles each recorded turn against the existing Paseo agent and its canonical timeline. It calls
