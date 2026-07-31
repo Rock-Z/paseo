@@ -180,10 +180,11 @@ test.describe("Native workflows", () => {
     }
   });
 
-  test("keeps the latest run list when an older poll arrives late", async ({ page }) => {
+  test("serializes slow run-list polls and catches up after the response", async ({ page }) => {
     const workspace = await seedWorkspace({ repoPrefix: "workflow-list-order-" });
     const name = uniqueWorkflowName("list-order");
     let inspectResponses = 0;
+    let runListRequests = 0;
     let gate: WorkflowResponseGate | null = null;
     try {
       await enablePaseoTools(workspace.client);
@@ -198,6 +199,9 @@ test.describe("Native workflows", () => {
         skip: 1,
         onServerMessage: (message) => {
           if (workflowInspectResponseRunId(message) === runId) inspectResponses += 1;
+        },
+        onClientMessage: (message) => {
+          if (isWorkflowRunListRequest(message)) runListRequests += 1;
         },
       });
       await page.goto(
@@ -217,7 +221,12 @@ test.describe("Native workflows", () => {
       await expect.poll(() => inspectResponses).toBe(1);
       await gate.waitForDelayedResponse();
       expect(inspectResponses).toBe(1);
+      await page.waitForTimeout(3_200);
+      expect(runListRequests).toBe(2);
       await waitForWorkflow(workspace.client, runId, ["complete"]);
+      await expect(runCard.getByText("running", { exact: true })).toBeVisible();
+
+      gate.release();
       await expect(runCard.getByText("complete", { exact: true })).toBeVisible({
         timeout: 10_000,
       });
@@ -225,8 +234,7 @@ test.describe("Native workflows", () => {
         page.getByTestId("workflow-run-details").getByText("complete", { exact: true }),
       ).toBeVisible();
       await expect.poll(() => inspectResponses).toBe(2);
-
-      gate.release();
+      expect(runListRequests).toBeGreaterThanOrEqual(3);
       await flushBrowserFrames(page);
       await expect(runCard.getByText("complete", { exact: true })).toBeVisible();
     } finally {
@@ -885,6 +893,7 @@ async function delayWorkflowResponse(
   shouldDelay: (message: string | Buffer) => boolean,
   options: {
     skip?: number;
+    onClientMessage?: (message: string | Buffer) => void;
     onServerMessage?: (message: string | Buffer) => void;
   } = {},
 ): Promise<WorkflowResponseGate> {
@@ -899,7 +908,10 @@ async function delayWorkflowResponse(
 
   await page.routeWebSocket(daemonWsRoutePattern(), (ws) => {
     const server = ws.connectToServer();
-    ws.onMessage((message) => server.send(message));
+    ws.onMessage((message) => {
+      options.onClientMessage?.(message);
+      server.send(message);
+    });
     server.onMessage((message) => {
       options.onServerMessage?.(message);
       if (!delayedResponseSeen && shouldDelay(message)) {
@@ -928,6 +940,20 @@ async function delayWorkflowResponse(
     },
     waitForDelayedResponse: () => delayedResponse,
   };
+}
+
+function isWorkflowRunListRequest(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return envelope.type === "session" && envelope.message?.type === "workflow.run.list.request";
+  } catch {
+    return false;
+  }
 }
 
 function isWorkflowRunListResponse(message: string | Buffer): boolean {

@@ -420,6 +420,34 @@ describe("workflow spec validation and materialization", () => {
     });
   });
 
+  it.each(["task", "inputs", "event"])("rejects the reserved map alias %s", (alias) => {
+    const spec = baseSpec();
+    spec.inputs = { items: [] };
+    const states = ((spec.flows as JsonObject).main as JsonObject).states as JsonObject;
+    states.fanout = {
+      map: {
+        group: "branches",
+        items: "{{ inputs.items }}",
+        as: alias,
+        call: { flow: "leaf", with: { value: `{{ ${alias} }}` } },
+        join: "all",
+      },
+      on: { joined: "finish" },
+    };
+    (spec.flows as JsonObject).leaf = {
+      initial: "finish",
+      inputs: { value: null },
+      states: { finish: { return: { output: "{{ inputs.value }}" } } },
+    };
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "flows.main.states.fanout.map.as",
+      message: "must not shadow a workflow value root",
+    });
+  });
+
   it("rejects recursive flow calls", () => {
     const spec = baseSpec();
     spec.flows = {

@@ -135,6 +135,7 @@ function WorkflowHostScreen({
   const launchPendingRef = useRef(false);
   const runMutationPendingRef = useRef(false);
   const loadRequestRef = useRef(0);
+  const loadPendingRef = useRef(0);
   const selectedRunIdRef = useRef<string | null>(null);
   const detailsRequestRef = useRef(0);
   const selectedSpecRequestRef = useRef(0);
@@ -143,6 +144,7 @@ function WorkflowHostScreen({
 
   const load = useCallback(
     async (quiet = false) => {
+      if (quiet && loadPendingRef.current > 0) return;
       const request = ++loadRequestRef.current;
       if (!client) {
         if (loadRequestRef.current === request) {
@@ -151,6 +153,7 @@ function WorkflowHostScreen({
         }
         return;
       }
+      loadPendingRef.current += 1;
       if (!quiet) setLoading(true);
       try {
         const [specPayload, runPayload] = await Promise.all([
@@ -168,6 +171,7 @@ function WorkflowHostScreen({
           setLoadError(errorMessage(error));
         }
       } finally {
+        loadPendingRef.current -= 1;
         if (loadRequestRef.current === request) setLoading(false);
       }
     },

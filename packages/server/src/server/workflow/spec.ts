@@ -1122,6 +1122,8 @@ function validateMap(
   }
   if (typeof value.as !== "string" || !IDENTIFIER.test(value.as)) {
     issues.add(`${path}.as`, "must be an identifier");
+  } else if (value.as !== "item" && WORKFLOW_VALUE_ROOTS.has(value.as)) {
+    issues.add(`${path}.as`, "must not shadow a workflow value root");
   }
   validateCall(value.call, `${path}.call`, flowNames, parameters, issues);
   if (value.join !== "all") {

@@ -213,7 +213,7 @@ export class WorkflowService {
           : "requested";
       tx.state.stopRequested = true;
       cancelQueuedTurns(tx, reason === "requested" ? "stop_requested" : reason);
-      tx.state.status = hasActiveTurns(tx.state) ? "stopping" : "stopped";
+      tx.state.status = hasDrainingWork(tx.state) ? "stopping" : "stopped";
       tx.state.reason = reason;
       if (tx.state.status === "stopped") tx.state.completedAt = new Date().toISOString();
       queueEvent(tx, {
@@ -385,9 +385,14 @@ export class WorkflowService {
       await this.updateElapsedAndLimits(runId);
       const current = parseState(await this.storage.readState(runId));
       if (isTerminal(current.status)) return;
-      if (current.stopRequested && !hasActiveTurns(current)) {
+      if (current.stopRequested && !hasDrainingWork(current)) {
         await this.finishStopped(runId);
         return;
+      }
+      const reservedWorkspace = Object.values(current.instances).find(workspaceProvisioningStarted);
+      if (current.stopRequested && reservedWorkspace) {
+        await this.provisionInstance(runId, reservedWorkspace);
+        continue;
       }
       const orphan = Object.values(current.instances).find(
         (instance) =>
@@ -468,41 +473,58 @@ export class WorkflowService {
 
   private async provisionInstance(runId: string, instance: WorkflowInstance): Promise<void> {
     const spec = await this.getRunSpec(runId);
-    if (instance.id === "root") {
+    const initialState = parseState(await this.storage.readState(runId));
+    const initialInstance = requireInstance(initialState, instance.id);
+    if (instance.id === "root" && !workspaceProvisioningStarted(initialInstance)) {
       await this.adapter.validateMaterializedSpec(spec, {});
     }
-    const latestState = parseState(await this.storage.readState(runId));
-    const latestInstance = requireInstance(latestState, instance.id);
-    if (
-      isTerminal(latestState.status) ||
-      latestState.stopRequested ||
-      latestInstance.status !== "provisioning"
-    ) {
-      return;
-    }
-    const request = latestInstance.workspaceRequest;
-    if (!request) throw new Error(`instance ${instance.id} has no workspace request`);
+    const request = await this.transact(runId, (tx) => {
+      const current = requireInstance(tx.state, instance.id);
+      const pending = current.workspaceRequest;
+      if (
+        !pending ||
+        isTerminal(tx.state.status) ||
+        current.status !== "provisioning" ||
+        (tx.state.stopRequested && !workspaceProvisioningStarted(current))
+      ) {
+        return null;
+      }
+      pending.started = true;
+      return { ...pending };
+    });
+    if (!request) return;
     let workspace: WorkflowWorkspace;
-    if (request.kind === "bound") {
-      workspace = await this.adapter.resolveBoundWorkspace({
-        workspaceId: String(request.workspaceId),
-        worktreePath: String(request.worktreePath),
+    try {
+      if (request.kind === "bound") {
+        workspace = await this.adapter.resolveBoundWorkspace({
+          workspaceId: String(request.workspaceId),
+          worktreePath: String(request.worktreePath),
+        });
+      } else {
+        const create = objectField(request, "create");
+        workspace = await this.adapter.ensureWorkspace({
+          runId,
+          instanceId: instance.id,
+          create,
+        });
+      }
+    } catch (error) {
+      await this.transact(runId, (tx) => {
+        const current = requireInstance(tx.state, instance.id);
+        if (workspaceProvisioningStarted(current) && current.workspaceRequest) {
+          delete current.workspaceRequest.started;
+        }
+        if (tx.state.stopRequested) {
+          finalizeRequestedStop(tx);
+        } else {
+          failState(tx, errorMessage(error));
+        }
       });
-    } else {
-      const create = objectField(request, "create");
-      workspace = await this.adapter.ensureWorkspace({
-        runId,
-        instanceId: instance.id,
-        create,
-      });
+      return;
     }
     await this.transact(runId, (tx) => {
       const current = requireInstance(tx.state, instance.id);
-      if (
-        isTerminal(tx.state.status) ||
-        tx.state.stopRequested ||
-        current.status !== "provisioning"
-      ) {
+      if (isTerminal(tx.state.status) || !workspaceProvisioningStarted(current)) {
         return;
       }
       current.workspace = workspace;
@@ -514,6 +536,7 @@ export class WorkflowService {
         flow: current.flow,
         details: { workspaceId: workspace.workspaceId, cwd: workspace.cwd },
       });
+      finalizeRequestedStop(tx);
     });
   }
 
@@ -1342,7 +1365,7 @@ function requestTerminal(
   reason: string,
 ): void {
   cancelQueuedTurns(tx, reason);
-  if (hasActiveTurns(tx.state)) {
+  if (hasDrainingWork(tx.state)) {
     tx.state.stopRequested = true;
     tx.state.status = "stopping";
     tx.state.reason = reason;
@@ -1353,7 +1376,7 @@ function requestTerminal(
 }
 
 function finalizeRequestedStop(tx: Transaction): void {
-  if (isTerminal(tx.state.status) || !tx.state.stopRequested || hasActiveTurns(tx.state)) return;
+  if (isTerminal(tx.state.status) || !tx.state.stopRequested || hasDrainingWork(tx.state)) return;
   const pending = tx.state.pendingTerminal;
   if (pending) {
     completeState(tx, pending.status, pending.reason);
@@ -1646,6 +1669,18 @@ function hasActiveTurns(state: WorkflowRunState): boolean {
   return countActiveTurns(state) > 0;
 }
 
+function hasDrainingWork(state: WorkflowRunState): boolean {
+  return hasActiveTurns(state) || Object.values(state.instances).some(workspaceProvisioningStarted);
+}
+
+function workspaceProvisioningStarted(instance: WorkflowInstance): boolean {
+  return (
+    instance.status === "provisioning" &&
+    isObject(instance.workspaceRequest) &&
+    instance.workspaceRequest.started === true
+  );
+}
+
 function countActiveTurns(state: WorkflowRunState): number {
   return Object.values(state.instances).filter((instance) => instance.activeTurn).length;
 }
@@ -1685,7 +1720,7 @@ function applyLimit(tx: Transaction, reason: string): void {
   tx.state.stopRequested = true;
   tx.state.reason = reason;
   if (reason !== "max_iterations") cancelQueuedTurns(tx, reason);
-  tx.state.status = hasActiveTurns(tx.state) ? "stopping" : "stopped";
+  tx.state.status = hasDrainingWork(tx.state) ? "stopping" : "stopped";
   tx.state.completedAt = tx.state.status === "stopped" ? new Date().toISOString() : null;
   queueEvent(tx, { type: "limit_reached", details: { reason } });
   if (tx.state.status === "stopped") {

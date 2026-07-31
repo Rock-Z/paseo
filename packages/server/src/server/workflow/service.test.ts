@@ -621,6 +621,73 @@ describe("WorkflowService runtime", () => {
     expect(details.events.filter((event) => event.type === "workspace_ready")).toHaveLength(0);
   });
 
+  it("records root workspace provisioning before a user stop becomes terminal", async () => {
+    const spec = baseSpec();
+    spec.bindings = {};
+    const { service, adapter } = await setup(spec);
+    let releaseWorkspace!: () => void;
+    adapter.workspaceGate = new Promise<void>((resolve) => {
+      releaseWorkspace = resolve;
+    });
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Record provisioned workspace before stop" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForWorkspaceCreates(1);
+
+    await expect(service.stopRun(run.id)).resolves.toMatchObject({
+      status: "stopping",
+      reason: "requested",
+      workspaceIds: [],
+    });
+    releaseWorkspace();
+
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
+      status: "stopped",
+      reason: "requested",
+      workspaceIds: ["workspace-root"],
+    });
+    const stopped = await service.inspectRun(run.id);
+    expect(stopped.events.filter((event) => event.type === "workspace_ready")).toHaveLength(1);
+    expect(adapter.starts).toHaveLength(0);
+  });
+
+  it("reconciles reserved workspace provisioning after restart before finalizing stop", async () => {
+    const spec = baseSpec();
+    spec.bindings = {};
+    const { service, storage, adapter } = await setup(spec);
+    adapter.workspaceGate = new Promise<void>(() => undefined);
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Reconcile provisioned workspace after restart" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForWorkspaceCreates(1);
+    await expect(service.stopRun(run.id)).resolves.toMatchObject({
+      status: "stopping",
+      reason: "requested",
+    });
+
+    service.dispose();
+    const restartedAdapter = new FakeRuntimeAdapter();
+    const restartedService = new WorkflowService({ storage, adapter: restartedAdapter });
+    await restartedService.initialize();
+    await restartedService.start();
+    await restartedAdapter.waitForWorkspaceCreates(1);
+
+    await expect(waitForRunTerminal(restartedService, run.id)).resolves.toMatchObject({
+      status: "stopped",
+      reason: "requested",
+      workspaceIds: ["workspace-root"],
+    });
+    const stopped = await restartedService.inspectRun(run.id);
+    expect(stopped.events.filter((event) => event.type === "workspace_ready")).toHaveLength(1);
+    expect(adapter.workspaceCreates).toEqual(["root"]);
+    expect(restartedAdapter.workspaceCreates).toEqual(["root"]);
+    expect([...adapter.starts, ...restartedAdapter.starts]).toHaveLength(0);
+  });
+
   it("drains agent provisioning, records its identity, and reuses it after stop and resume", async () => {
     const spec = baseSpec();
     const worker = (spec.agents as JsonObject).worker as JsonObject;
@@ -707,18 +774,23 @@ describe("WorkflowService runtime", () => {
     (runtimeTimer as () => void)();
     (runtimeTimer as () => void)();
 
-    await expect(waitForRunStatus(service, run.id, ["stopped"], 1_000)).resolves.toMatchObject({
+    await expect(waitForRunStatus(service, run.id, ["stopping"], 1_000)).resolves.toMatchObject({
       reason: "max_runtime",
     });
     const limited = await service.inspectRun(run.id);
     expect(limited.events.filter((event) => event.type === "limit_reached")).toHaveLength(1);
-    expect(limited.events.filter((event) => event.type === "run_stopped")).toHaveLength(1);
+    expect(limited.events.filter((event) => event.type === "run_stopped")).toHaveLength(0);
 
     releaseWorkspace();
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
+      status: "stopped",
+      reason: "max_runtime",
+      workspaceIds: ["workspace-root"],
+    });
     const settled = await service.inspectRun(run.id);
     expect(adapter.starts).toHaveLength(0);
-    expect(settled.events.filter((event) => event.type === "workspace_ready")).toHaveLength(0);
+    expect(settled.events.filter((event) => event.type === "workspace_ready")).toHaveLength(1);
+    expect(settled.events.filter((event) => event.type === "run_stopped")).toHaveLength(1);
   });
 
   it("evicts a stopped run spec and reloads it when the run resumes", async () => {
