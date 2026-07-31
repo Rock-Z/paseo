@@ -723,7 +723,7 @@ export class WorkflowService {
           details: { workflowTurnId },
         });
       }
-      if (tx.state.stopRequested) {
+      if (tx.state.stopRequested && tx.state.reason !== "max_iterations") {
         const reason =
           tx.state.reason === "requested"
             ? "stop_requested"

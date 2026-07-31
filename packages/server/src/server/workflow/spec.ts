@@ -140,7 +140,7 @@ function validateWorkflow(
   }
 
   const parameters = validateParameters(value.parameters, issues);
-  validateTemplateExpressions(value, parameters, templateRoots(value.flows), issues);
+  validateTemplateExpressions(value, parameters, WORKFLOW_VALUE_ROOTS, issues);
   const agents = validateAgents(value.agents, issues);
   validateBindings(value.bindings, agents, issues);
   validateWorkspace(value.workspace, "workspace", parameters, issues);
@@ -324,23 +324,35 @@ function collectTemplateExpressions(
     if (!path && key === "parameters") {
       continue;
     }
-    collectTemplateExpressions(item, path ? `${path}.${key}` : key, found, roots, issues);
+    const itemPath = path ? `${path}.${key}` : key;
+    if (key === "map" && isObject(item)) {
+      collectMapTemplateExpressions(item, itemPath, found, roots, issues);
+    } else {
+      collectTemplateExpressions(item, itemPath, found, roots, issues);
+    }
   }
 }
 
-function templateRoots(flows: unknown): ReadonlySet<string> {
-  const roots = new Set(WORKFLOW_VALUE_ROOTS);
-  if (!isObject(flows)) return roots;
-  for (const flow of Object.values(flows)) {
-    if (!isObject(flow) || !isObject(flow.states)) continue;
-    for (const state of Object.values(flow.states)) {
-      if (!isObject(state) || !isObject(state.map)) continue;
-      if (typeof state.map.as === "string" && IDENTIFIER.test(state.map.as)) {
-        roots.add(state.map.as);
-      }
-    }
+function collectMapTemplateExpressions(
+  map: JsonObject,
+  path: string,
+  found: Set<string>,
+  roots: ReadonlySet<string>,
+  issues: Issues,
+): void {
+  const callRoots = new Set(roots);
+  if (typeof map.as === "string" && IDENTIFIER.test(map.as)) {
+    callRoots.add(map.as);
   }
-  return roots;
+  for (const [key, item] of Object.entries(map)) {
+    collectTemplateExpressions(
+      item,
+      `${path}.${key}`,
+      found,
+      key === "call" ? callRoots : roots,
+      issues,
+    );
+  }
 }
 
 function validateBindings(
@@ -706,6 +718,9 @@ function validateSchedulerCycles(
   issues: Issues,
 ): void {
   const returnsWithoutTurn = createZeroTurnReturnResolver(flows, flowNames);
+  for (const [flowName, flow] of Object.entries(flows)) {
+    validateReachableSchedulerStateCycles(flowName, flow, flowNames, returnsWithoutTurn, issues);
+  }
   const calls = collectZeroTurnFlowCalls(flows, flowNames, returnsWithoutTurn, issues);
 
   const visited = new Set<string>();
@@ -731,6 +746,81 @@ function validateSchedulerCycles(
     visited.add(flowName);
   };
   for (const flowName of flowNames) visit(flowName);
+}
+
+function validateReachableSchedulerStateCycles(
+  flowName: string,
+  flowValue: unknown,
+  flowNames: ReadonlySet<string>,
+  returnsWithoutTurn: (flowName: string) => boolean,
+  issues: Issues,
+): void {
+  if (
+    !isObject(flowValue) ||
+    !isObject(flowValue.states) ||
+    typeof flowValue.initial !== "string"
+  ) {
+    return;
+  }
+  const states = flowValue.states;
+  const reachable = reachableStates(flowValue);
+  const visited = new Set<string>();
+  const stack: string[] = [];
+  const stackIndexes = new Map<string, number>();
+  const visit = (stateName: string): void => {
+    if (visited.has(stateName)) return;
+    stackIndexes.set(stateName, stack.length);
+    stack.push(stateName);
+    const stateValue: unknown = states[stateName];
+    const state = isObject(stateValue) ? stateValue : null;
+    const scheduler = state ? schedulerCall(state) : null;
+    if (scheduler) {
+      const { action, actionPath, continuationEvent } = scheduler;
+      const canContinue =
+        actionPath === "map.call" ||
+        (typeof action.flow === "string" &&
+          flowNames.has(action.flow) &&
+          returnsWithoutTurn(action.flow));
+      const routes: JsonObject = state && isObject(state.on) ? state.on : {};
+      const continuation = canContinue ? routes[continuationEvent] : undefined;
+      if (typeof continuation === "string" && reachable.has(continuation)) {
+        const cycleStart = stackIndexes.get(continuation);
+        if (cycleStart !== undefined) {
+          const cycle = [...stack.slice(cycleStart), continuation]
+            .map((cycleState) => `${flowName}.${cycleState}`)
+            .join(" -> ");
+          issues.add(
+            `flows.${flowName}.states.${stateName}.on.${continuationEvent}`,
+            `scheduler state cycle: ${cycle}`,
+          );
+        } else {
+          visit(continuation);
+        }
+      }
+    }
+    stack.pop();
+    stackIndexes.delete(stateName);
+    visited.add(stateName);
+  };
+  for (const stateName of reachable) visit(stateName);
+}
+
+function reachableStates(flow: JsonObject): ReadonlySet<string> {
+  const reachable = new Set<string>();
+  if (!isObject(flow.states) || typeof flow.initial !== "string") return reachable;
+  const states = flow.states;
+  const pending = [flow.initial];
+  while (pending.length > 0) {
+    const stateName = pending.pop();
+    if (!stateName || reachable.has(stateName)) continue;
+    reachable.add(stateName);
+    const state = states[stateName];
+    if (!isObject(state) || !isObject(state.on)) continue;
+    for (const target of Object.values(state.on)) {
+      if (typeof target === "string" && !reachable.has(target)) pending.push(target);
+    }
+  }
+  return reachable;
 }
 
 function collectZeroTurnFlowCalls(

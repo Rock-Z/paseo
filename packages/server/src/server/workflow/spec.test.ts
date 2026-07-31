@@ -389,6 +389,37 @@ describe("workflow spec validation and materialization", () => {
     });
   });
 
+  it("does not expose a map alias to unrelated prompts", () => {
+    const spec = baseSpec();
+    spec.inputs = { items: [] };
+    (spec.prompts as Record<string, unknown>).work = "{{ branch }}";
+    const flows = spec.flows as Record<string, Record<string, unknown>>;
+    const main = flows.main;
+    const states = main.states as Record<string, Record<string, unknown>>;
+    states.fanout = {
+      map: {
+        group: "branches",
+        items: "{{ inputs.items }}",
+        as: "branch",
+        call: { flow: "leaf", with: { value: "{{ branch }}" } },
+        join: "all",
+      },
+      on: { joined: "finish" },
+    };
+    flows.leaf = {
+      initial: "finish",
+      inputs: { value: null },
+      states: { finish: { return: { output: "{{ inputs.value }}" } } },
+    };
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "prompts.work",
+      message: "has unsupported workflow value root: branch",
+    });
+  });
+
   it("rejects recursive flow calls", () => {
     const spec = baseSpec();
     spec.flows = {
@@ -436,6 +467,43 @@ describe("workflow spec validation and materialization", () => {
             call: { flow: "leaf" },
             on: { returned: "loop" },
           },
+        },
+      },
+      leaf: {
+        initial: "finish",
+        states: {
+          finish: { return: { output: "done" } },
+        },
+      },
+    };
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "flows.main.states.loop.on.returned",
+      message: "scheduler state cycle: main.loop -> main.loop",
+    });
+  });
+
+  it("rejects scheduler-state cycles reached after a turn", () => {
+    const spec = baseSpec();
+    spec.flows = {
+      main: {
+        initial: "work",
+        states: {
+          work: {
+            turn: {
+              agent: "worker",
+              prompt: "work",
+              emits: { done: { description: "Continue to scheduler work" } },
+            },
+            on: { done: "loop", "error.agent": "failed", "error.protocol": "failed" },
+          },
+          loop: {
+            call: { flow: "leaf" },
+            on: { returned: "loop" },
+          },
+          failed: { stop: { reason: "{{ event.message }}" } },
         },
       },
       leaf: {
