@@ -244,6 +244,74 @@ test.describe("Native workflows", () => {
     }
   });
 
+  test("forces a post-launch list refresh across a slow poll", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-launch-refresh-" });
+    const name = uniqueWorkflowName("launch-refresh");
+    let runListRequests = 0;
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 30_000 }));
+      const existingRunId = await startWorkflow(workspace.client, {
+        workflowId: name,
+        workspaceId: workspace.workspaceId,
+      });
+      await waitForActiveTurn(workspace.client, existingRunId);
+
+      gate = await delayWorkflowResponse(page, isWorkflowRunListResponse, {
+        skip: 1,
+        onClientMessage: (message) => {
+          if (isWorkflowRunListRequest(message)) runListRequests += 1;
+        },
+      });
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      await expect(page.getByTestId(`workflow-run-${existingRunId}`)).toBeVisible({
+        timeout: 30_000,
+      });
+      await page.getByTestId(`workflow-spec-${name}`).click();
+      await expect(page.getByTestId("workflow-launch-form")).toBeVisible();
+      await gate.waitForDelayedResponse();
+      expect(runListRequests).toBe(2);
+
+      const before = await workspace.client.workflowRunList();
+      expect(before.error).toBeNull();
+      const beforeIds = new Set(before.runs.map((run) => run.id));
+      await page.getByTestId("workflow-launch-submit").click();
+      await expect(page.getByTestId("workflows-action-success")).toContainText("Queued wfr_");
+
+      let launchedRunId: string | null = null;
+      await expect
+        .poll(async () => {
+          const payload = await workspace.client.workflowRunList();
+          if (payload.error) throw new Error(payload.error);
+          for (const run of payload.runs) {
+            if (!beforeIds.has(run.id)) {
+              launchedRunId = run.id;
+              break;
+            }
+          }
+          return launchedRunId;
+        })
+        .not.toBeNull();
+      if (!launchedRunId) throw new Error("launched workflow run was not listed");
+
+      await expect(page.getByTestId(`workflow-run-${launchedRunId}`)).toBeVisible();
+      expect(runListRequests).toBe(3);
+      gate.release();
+      await flushBrowserFrames(page);
+      await expect(page.getByTestId(`workflow-run-${launchedRunId}`)).toBeVisible();
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
   test("refreshes selected details when a terminal status shares the running timestamp", async ({
     page,
   }) => {

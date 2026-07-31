@@ -36,6 +36,8 @@ type ActionStatus =
   | { kind: "success"; message: string }
   | { kind: "error"; message: string };
 
+type LoadMode = "foreground" | "background" | "refresh";
+
 const EMPTY_FORM: WorkflowLaunchForm = { values: {}, errors: {} };
 const ACTIVE_STATUSES = new Set(["queued", "running", "stopping"]);
 
@@ -145,8 +147,8 @@ function WorkflowHostScreen({
   const client = useHostRuntimeClient(serverId);
 
   const load = useCallback(
-    async (quiet = false) => {
-      if (quiet && loadPendingRef.current > 0) return;
+    async (mode: LoadMode = "foreground") => {
+      if (mode === "background" && loadPendingRef.current > 0) return;
       const request = ++loadRequestRef.current;
       if (!client) {
         if (loadRequestRef.current === request) {
@@ -156,7 +158,7 @@ function WorkflowHostScreen({
         return;
       }
       loadPendingRef.current += 1;
-      if (!quiet) setLoading(true);
+      if (mode === "foreground") setLoading(true);
       try {
         const [specPayload, runPayload] = await Promise.all([
           client.workflowSpecList(),
@@ -224,7 +226,7 @@ function WorkflowHostScreen({
   useEffect(() => {
     if (!runs.some((run) => ACTIVE_STATUSES.has(run.status))) return;
     const timer = setInterval(() => {
-      void load(true);
+      void load("background");
     }, 1_500);
     return () => clearInterval(timer);
   }, [load, runs]);
@@ -295,7 +297,7 @@ function WorkflowHostScreen({
       setValidation(null);
       selectedRunIdRef.current = payload.run.id;
       setDetails(null);
-      await load(true);
+      await load("refresh");
       await refreshDetails(payload.run.id);
     } catch (error) {
       setAction({ kind: "error", message: errorMessage(error) });
@@ -346,7 +348,7 @@ function WorkflowHostScreen({
       }
       setAction({ kind: "success", message: `Saved ${payload.summary.name}` });
       setEditorOpen(false);
-      await load(true);
+      await load("refresh");
     } catch (error) {
       setAction({ kind: "error", message: errorMessage(error) });
     } finally {
@@ -383,7 +385,7 @@ function WorkflowHostScreen({
           kind: "success",
           message: kind === "stop" ? "Stop requested." : "Workflow resumed.",
         });
-        await load(true);
+        await load("refresh");
         await refreshDetails(details.run.id);
       } catch (error) {
         setAction({ kind: "error", message: errorMessage(error) });
