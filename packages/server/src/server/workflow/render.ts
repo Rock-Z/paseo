@@ -8,6 +8,10 @@ const ANY_TAG = /{%\s*([^%]+?)\s*%}/;
 const ALL_TAGS = /{%\s*([^%]+?)\s*%}/g;
 const IF_TAG = /^if\s+[A-Za-z_][A-Za-z0-9_.]*\s*==\s*(["']).*?\1$/;
 
+export function isExactValueExpression(value: unknown): value is string {
+  return typeof value === "string" && EXACT_VALUE.test(value);
+}
+
 export function promptTemplateIssue(template: string): string | null {
   let open = false;
   for (const match of template.matchAll(ALL_TAGS)) {

@@ -5,7 +5,7 @@ import type {
   WorkflowValidationResult,
 } from "@getpaseo/protocol/workflow/types";
 import { canonicalJson, type JsonObject } from "./json.js";
-import { promptTemplateIssue, renderValue } from "./render.js";
+import { isExactValueExpression, promptTemplateIssue, renderValue } from "./render.js";
 
 export { canonicalJson, type JsonObject } from "./json.js";
 
@@ -760,6 +760,8 @@ function validateMap(
   }
   if (typeof value.items !== "string" || !value.items.trim()) {
     issues.add(`${path}.items`, "must be a non-empty string");
+  } else if (!isExactValueExpression(value.items)) {
+    issues.add(`${path}.items`, "must be an exact value expression");
   }
   if (typeof value.as !== "string" || !IDENTIFIER.test(value.as)) {
     issues.add(`${path}.as`, "must be an identifier");

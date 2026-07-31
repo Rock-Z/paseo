@@ -349,4 +349,37 @@ describe("workflow spec validation and materialization", () => {
     };
     expect(validateWorkflowTemplate(spec)).toMatchObject({ valid: true, issues: [] });
   });
+
+  it.each(["branches", "[1, 2]", "prefix {{ event.data.items }}"])(
+    "rejects map item string %j that cannot render to an array",
+    (items) => {
+      const spec = baseSpec();
+      const flows = spec.flows as Record<string, Record<string, unknown>>;
+      flows.child = {
+        initial: "finish",
+        inputs: {},
+        states: { finish: { return: { output: "{{ inputs }}" } } },
+      };
+      const main = flows.main;
+      const states = main.states as Record<string, Record<string, unknown>>;
+      states.work = {
+        map: {
+          group: "branches",
+          items,
+          as: "branch",
+          call: { flow: "child", with: { branch: "{{ branch }}" } },
+          join: "all",
+        },
+        on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+      };
+
+      const result = validateWorkflowTemplate(spec);
+      expect(result.valid).toBe(false);
+      expect(result.issues).toContainEqual(
+        expect.objectContaining({
+          path: "flows.main.states.work.map.items",
+        }),
+      );
+    },
+  );
 });

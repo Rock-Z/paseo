@@ -179,7 +179,7 @@ test.describe("Native workflows", () => {
     }
   });
 
-  test("keeps the latest workflow definition selected when an older load arrives late", async ({
+  test("keeps the latest definition selected and resets shared inputs when switching", async ({
     page,
   }) => {
     const workspace = await seedWorkspace({ repoPrefix: "workflow-spec-selection-" });
@@ -187,14 +187,18 @@ test.describe("Native workflows", () => {
     const secondName = uniqueWorkflowName("spec-second");
     let gate: WorkflowResponseGate | null = null;
     try {
-      await saveWorkflow(
-        workspace.client,
-        buildSingleTurnWorkflow({ name: firstName, delayMs: 0 }),
-      );
-      await saveWorkflow(
-        workspace.client,
-        buildSingleTurnWorkflow({ name: secondName, delayMs: 0 }),
-      );
+      const firstSpec = buildSingleTurnWorkflow({ name: firstName, delayMs: 0 });
+      const secondSpec = buildSingleTurnWorkflow({ name: secondName, delayMs: 0 });
+      (firstSpec.parameters as Record<string, unknown>).shared = {
+        type: "string",
+        default: "first default",
+      };
+      (secondSpec.parameters as Record<string, unknown>).shared = {
+        type: "string",
+        default: "second default",
+      };
+      await saveWorkflow(workspace.client, firstSpec);
+      await saveWorkflow(workspace.client, secondSpec);
       gate = await delayWorkflowResponse(
         page,
         (message) => workflowSpecGetResponseId(message) === firstName,
@@ -219,6 +223,14 @@ test.describe("Native workflows", () => {
       await expect(page.getByTestId("workflow-launch-form")).not.toContainText(
         `Launch ${firstName}`,
       );
+
+      await page.getByTestId(`workflow-spec-${firstName}`).click();
+      const sharedInput = page.getByTestId("workflow-param-shared").getByRole("textbox");
+      await expect(sharedInput).toHaveValue("first default");
+      await sharedInput.fill("typed for first workflow");
+      await page.getByTestId(`workflow-spec-${secondName}`).click();
+      await expect(page.getByTestId("workflow-launch-form")).toContainText(`Launch ${secondName}`);
+      await expect(sharedInput).toHaveValue("second default");
     } finally {
       gate?.release();
       await page.goto("about:blank").catch(() => undefined);

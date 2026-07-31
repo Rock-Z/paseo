@@ -429,6 +429,7 @@ function WorkflowHostScreen({
             </View>
             {selectedSpec && validation ? (
               <LaunchForm
+                key={selectedSpec.id}
                 spec={selectedSpec}
                 validation={validation}
                 form={launchForm}
