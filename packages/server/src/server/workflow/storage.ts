@@ -208,6 +208,23 @@ export class WorkflowStorage {
     return name;
   }
 
+  async readRenderedPrompt(runId: string, promptName: string): Promise<string> {
+    const name = safePromptName(promptName);
+    const state = await this.readState(runId);
+    if (!promptIdentities(state).has(name)) {
+      throw new Error(`rendered prompt is not referenced by workflow state: ${name}`);
+    }
+    const { directory } = await this.resolveRun(runId);
+    const promptDirectory = path.join(directory, "rendered-prompts");
+    const filePath = path.join(promptDirectory, name);
+    if (!(await exists(promptDirectory)) || !(await exists(filePath))) {
+      throw new Error(`rendered prompt is missing: ${name}`);
+    }
+    await assertDirectoryNotSymlink(promptDirectory);
+    await assertNotSymlink(filePath);
+    return fs.readFile(filePath, "utf8");
+  }
+
   async inspectRun(runId: string): Promise<WorkflowRunDetails> {
     await this.recoverRun(runId);
     const resolved = await this.resolveRun(runId);

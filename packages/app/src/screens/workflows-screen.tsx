@@ -130,6 +130,7 @@ function WorkflowHostScreen({
   const [action, setAction] = useState<ActionStatus>({ kind: "idle" });
   const [editorOpen, setEditorOpen] = useState(false);
   const [editor, setEditor] = useState("");
+  const loadRequestRef = useRef(0);
   const selectedRunIdRef = useRef<string | null>(null);
   const detailsRequestRef = useRef(0);
   const selectedSpecRequestRef = useRef(0);
@@ -138,9 +139,12 @@ function WorkflowHostScreen({
 
   const load = useCallback(
     async (quiet = false) => {
+      const request = ++loadRequestRef.current;
       if (!client) {
-        setLoadError("The host is disconnected. Reconnect, then try again.");
-        setLoading(false);
+        if (loadRequestRef.current === request) {
+          setLoadError("The host is disconnected. Reconnect, then try again.");
+          setLoading(false);
+        }
         return;
       }
       if (!quiet) setLoading(true);
@@ -149,15 +153,18 @@ function WorkflowHostScreen({
           client.workflowSpecList(),
           client.workflowRunList(),
         ]);
+        if (loadRequestRef.current !== request) return;
         if (specPayload.error) throw new Error(specPayload.error);
         if (runPayload.error) throw new Error(runPayload.error);
         setSpecs(specPayload.specs);
         setRuns(runPayload.runs);
         setLoadError(null);
       } catch (error) {
-        setLoadError(errorMessage(error));
+        if (loadRequestRef.current === request) {
+          setLoadError(errorMessage(error));
+        }
       } finally {
-        if (!quiet) setLoading(false);
+        if (loadRequestRef.current === request) setLoading(false);
       }
     },
     [client],

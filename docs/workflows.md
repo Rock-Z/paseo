@@ -57,6 +57,7 @@ becomes `event.message`; optional data is checked against the event's JSON Schem
 `event.data`. Invalid, missing, stale, unauthorized, and duplicate events do not route the flow.
 Protocol failures can retry the same turn up to the declared repair limit, then use the
 `error.protocol` route. Agent failures use `error.agent`. There is no prose or sentinel routing.
+`maxRuntime` stops the run through the limit path; it is not a routable action error.
 
 `call` starts a nested flow. `map` starts one child flow per item, honors its concurrency bound, and
 joins results in input order. A child may reuse the parent workspace or create an isolated Paseo

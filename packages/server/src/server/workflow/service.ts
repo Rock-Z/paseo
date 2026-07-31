@@ -659,10 +659,7 @@ export class WorkflowService {
       existingAgentId: existing,
     });
     await this.adapter.waitUntilAgentIdle(agentId);
-    const prompt = (await this.storage.inspectRun(runId)).prompts.find(
-      (candidate) => candidate.name === turn.promptPath,
-    )?.content;
-    if (prompt === undefined) throw new Error(`rendered prompt is missing: ${turn.promptPath}`);
+    const prompt = await this.storage.readRenderedPrompt(runId, turn.promptPath);
     const started = await this.withAgentLock(agentId, async () => {
       await this.adapter.waitUntilAgentIdle(agentId);
       return this.startTurnIfAllowed(runId, instanceId, turn.workflowTurnId, agentId, {

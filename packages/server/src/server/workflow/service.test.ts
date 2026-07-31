@@ -284,10 +284,16 @@ class ReadHookWorkflowStorage extends WorkflowStorage {
 
 class CountingReadHookWorkflowStorage extends ReadHookWorkflowStorage {
   inspectRunCalls = 0;
+  readRenderedPromptCalls = 0;
 
   override async inspectRun(runId: string) {
     this.inspectRunCalls += 1;
     return super.inspectRun(runId);
+  }
+
+  override async readRenderedPrompt(runId: string, name: string) {
+    this.readRenderedPromptCalls += 1;
+    return super.readRenderedPrompt(runId, name);
   }
 }
 
@@ -490,6 +496,39 @@ afterEach(async () => {
 });
 
 describe("WorkflowService runtime", () => {
+  it("reads only the rendered prompt needed to launch a turn", async () => {
+    let releaseValidation!: () => void;
+    const { service, storage, adapter } = await setup(
+      baseSpec(),
+      (options) => new CountingReadHookWorkflowStorage(options),
+    );
+    adapter.validateGate = new Promise<void>((resolve) => {
+      releaseValidation = resolve;
+    });
+    const run = await service.startRun({
+      workflowId: "runtime-fixture",
+      parameters: { objective: "Read one prompt" },
+      context: { workspaceId: "workspace-root" },
+    });
+    await adapter.waitForValidations(1);
+    const inspectCallsBeforeLaunch = storage.inspectRunCalls;
+
+    releaseValidation();
+    await adapter.waitForStarts(1);
+
+    expect(storage.inspectRunCalls).toBe(inspectCallsBeforeLaunch);
+    expect(storage.readRenderedPromptCalls).toBe(1);
+    expect(adapter.starts[0].request.prompt).toContain("Complete Read one prompt.");
+    await service.emitEvent({
+      callerAgentId: adapter.starts[0].request.agentId,
+      event: "done",
+      data: { value: "complete" },
+    });
+    adapter.complete(adapter.starts[0].request.agentId);
+    await waitForStoredRunStatus(storage, run.id, "complete");
+    service.dispose();
+  });
+
   it("retains a resume kick while the current driver is exiting", async () => {
     const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
     const { service, storage, adapter } = await setup(

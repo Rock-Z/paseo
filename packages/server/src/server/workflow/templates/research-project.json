@@ -196,7 +196,7 @@
           "on": {
             "joined": "integrate",
             "error.agent": "failed",
-            "error.timeout": "failed"
+            "error.protocol": "failed"
           }
         },
         "integrate": {

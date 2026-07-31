@@ -36,7 +36,7 @@ const TOP_FIELDS = new Set([
   "parameters",
 ]);
 const ACTIONS = ["turn", "call", "map", "return", "stop"] as const;
-const RUNTIME_EVENTS = new Set(["error.agent", "error.protocol", "error.timeout"]);
+const RUNTIME_EVENTS = new Set(["error.agent", "error.protocol"]);
 const PARAMETER_TYPES = new Set([
   "string",
   "path",
@@ -211,7 +211,7 @@ function validateParameters(value: unknown, issues: Issues): Map<string, JsonObj
   ]);
   for (const [name, declaration] of Object.entries(value)) {
     const path = `parameters.${name}`;
-    if (!IDENTIFIER.test(name)) {
+    if (!IDENTIFIER.test(name) || PROTOTYPE_SENSITIVE_NAMES.has(name)) {
       issues.add(path, "invalid parameter name");
     }
     if (!issues.object(declaration, path)) {

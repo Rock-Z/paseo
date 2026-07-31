@@ -180,6 +180,46 @@ test.describe("Native workflows", () => {
     }
   });
 
+  test("keeps the latest run list when an older poll arrives late", async ({ page }) => {
+    const workspace = await seedWorkspace({ repoPrefix: "workflow-list-order-" });
+    const name = uniqueWorkflowName("list-order");
+    let gate: WorkflowResponseGate | null = null;
+    try {
+      await enablePaseoTools(workspace.client);
+      await saveWorkflow(workspace.client, buildSingleTurnWorkflow({ name, delayMs: 15_000 }));
+      const runId = await startWorkflow(workspace.client, {
+        workflowId: name,
+        workspaceId: workspace.workspaceId,
+      });
+      await waitForActiveTurn(workspace.client, runId);
+
+      gate = await delayWorkflowResponse(page, isWorkflowRunListResponse, { skip: 1 });
+      await page.goto(
+        buildWorkflowsRoute({
+          serverId: getServerId(),
+          workspaceId: workspace.workspaceId,
+        }),
+      );
+      const runCard = page.getByTestId(`workflow-run-${runId}`);
+      await expect(runCard.getByText("running", { exact: true })).toBeVisible({
+        timeout: 30_000,
+      });
+      await gate.waitForDelayedResponse();
+      await waitForWorkflow(workspace.client, runId, ["complete"]);
+      await expect(runCard.getByText("complete", { exact: true })).toBeVisible({
+        timeout: 10_000,
+      });
+
+      gate.release();
+      await flushBrowserFrames(page);
+      await expect(runCard.getByText("complete", { exact: true })).toBeVisible();
+    } finally {
+      gate?.release();
+      await page.goto("about:blank").catch(() => undefined);
+      await workspace.cleanup();
+    }
+  });
+
   test("keeps the latest definition selected and resets shared inputs when switching", async ({
     page,
   }) => {
@@ -630,9 +670,11 @@ interface WorkflowResponseGate {
 async function delayWorkflowResponse(
   page: Page,
   shouldDelay: (message: string | Buffer) => boolean,
+  options: { skip?: number } = {},
 ): Promise<WorkflowResponseGate> {
   let releaseRequested = false;
   let delayedResponseSeen = false;
+  let skippedResponses = 0;
   const delayedForwards: Array<() => void> = [];
   let resolveDelayedResponse!: () => void;
   const delayedResponse = new Promise<void>((resolve) => {
@@ -644,6 +686,11 @@ async function delayWorkflowResponse(
     ws.onMessage((message) => server.send(message));
     server.onMessage((message) => {
       if (!delayedResponseSeen && shouldDelay(message)) {
+        if (skippedResponses < (options.skip ?? 0)) {
+          skippedResponses += 1;
+          ws.send(message);
+          return;
+        }
         delayedResponseSeen = true;
         resolveDelayedResponse();
         if (releaseRequested) {
@@ -664,6 +711,20 @@ async function delayWorkflowResponse(
     },
     waitForDelayedResponse: () => delayedResponse,
   };
+}
+
+function isWorkflowRunListResponse(message: string | Buffer): boolean {
+  try {
+    const envelope = JSON.parse(
+      typeof message === "string" ? message : message.toString("utf8"),
+    ) as {
+      type?: unknown;
+      message?: { type?: unknown };
+    };
+    return envelope.type === "session" && envelope.message?.type === "workflow.run.list.response";
+  } catch {
+    return false;
+  }
 }
 
 function workflowSpecGetResponseId(message: string | Buffer): string | null {

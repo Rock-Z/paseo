@@ -255,6 +255,38 @@ describe("workflow spec validation and materialization", () => {
     expect(validateWorkflowTemplate(nested)).toMatchObject({ valid: true, issues: [] });
   });
 
+  it.each(["__proto__", "constructor", "prototype"])(
+    "rejects prototype-sensitive parameter name %j",
+    (name) => {
+      const spec = baseSpec();
+      spec.parameters = {
+        ...(spec.parameters as Record<string, unknown>),
+        [name]: { type: "string", default: "declared" },
+      };
+
+      const result = validateWorkflowTemplate(spec);
+      expect(result.valid).toBe(false);
+      expect(result.issues).toContainEqual({
+        path: `parameters.${name}`,
+        message: "invalid parameter name",
+      });
+    },
+  );
+
+  it("rejects the reserved but unreachable error.timeout route", () => {
+    const spec = baseSpec();
+    const flows = spec.flows as Record<string, Record<string, unknown>>;
+    const states = flows.main.states as Record<string, Record<string, Record<string, unknown>>>;
+    states.work.on["error.timeout"] = "failed";
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "flows.main.states.work.on.error.timeout",
+      message: "unsupported event",
+    });
+  });
+
   it("rejects unsupported prompt template tags before a run is saved", () => {
     const spec = baseSpec();
     (spec.prompts as Record<string, unknown>).work =

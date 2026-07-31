@@ -277,6 +277,15 @@ describe("WorkflowStorage", () => {
         },
       ],
     });
+    await expect(storage.readRenderedPrompt("prompt-audit", "visible.txt")).resolves.toBe(
+      "visible prompt",
+    );
+    await expect(storage.readRenderedPrompt("prompt-audit", "orphan.txt")).rejects.toThrow(
+      "rendered prompt is not referenced",
+    );
+    await expect(storage.readRenderedPrompt("prompt-audit", "../visible.txt")).rejects.toThrow(
+      "invalid rendered prompt name",
+    );
   });
 
   it("reads historical spec.yaml runs without making unsafe legacy states resumable", async () => {
@@ -338,12 +347,26 @@ describe("WorkflowStorage", () => {
       createdAt: now,
       updatedAt: now,
       loop: { iteration: 0 },
+      instances: {
+        root: {
+          activeTurn: {
+            workflowTurnId: "wft_leak",
+            instanceId: "root",
+            agentId: "agent-1",
+            promptPath: "leak.txt",
+            createdAt: now,
+          },
+        },
+      },
     });
     const secret = path.join(outside, "secret.txt");
     await fs.writeFile(secret, "historical private prompt");
     await fs.symlink(
       secret,
       path.join(paseoHome, "workflows", "runs", "prompt-run", "rendered-prompts", "leak.txt"),
+    );
+    await expect(storage.readRenderedPrompt("prompt-run", "leak.txt")).rejects.toThrow(
+      "symbolic link",
     );
     await expect(storage.inspectRun("prompt-run")).rejects.toThrow("symbolic link");
   });
