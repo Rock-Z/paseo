@@ -426,16 +426,16 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
 
   private async waitForTurnResult(
     agentId: string,
-    nativeTurnId: string | null,
+    nativeTurnId: string,
     clientMessageId: string,
     autonomous = false,
   ): Promise<WorkflowTurnResult> {
-    while (
+    const isActive = () =>
       autonomous
-        ? this.isAgentBusy(agentId)
-        : this.agentManager.getAgent(agentId)?.activeForegroundTurnId === nativeTurnId
-    ) {
-      await this.waitForAgentStateChange(agentId);
+        ? this.isAutonomousTurnActive(agentId, nativeTurnId)
+        : this.agentManager.getAgent(agentId)?.activeForegroundTurnId === nativeTurnId;
+    while (isActive()) {
+      await this.waitForAgentStateChange(agentId, () => !isActive());
     }
     return (
       (await this.findHistoricalTurnResult(agentId, nativeTurnId, clientMessageId)) ?? {
@@ -446,6 +446,13 @@ export class PaseoWorkflowRuntimeAdapter implements WorkflowRuntimeAdapter {
         lastError: "native workflow turn ended without durable timeline evidence",
       }
     );
+  }
+
+  private isAutonomousTurnActive(agentId: string, nativeTurnId: string): boolean {
+    const activeAutonomousTurnId = this.agentManager.getActiveAutonomousTurnId(agentId);
+    if (activeAutonomousTurnId) return activeAutonomousTurnId === nativeTurnId;
+    const agent = this.agentManager.getAgent(agentId);
+    return agent?.activeForegroundTurnId === null && this.isAgentBusy(agentId);
   }
 
   private async hasSubmittedWorkflowTurn(

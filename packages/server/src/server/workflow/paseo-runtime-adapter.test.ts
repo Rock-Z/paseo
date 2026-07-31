@@ -405,9 +405,7 @@ describe("PaseoWorkflowRuntimeAdapter", () => {
     });
     if (reconciliation.state !== "active") throw new Error("Expected active reconciliation");
 
-    busy = false;
-    autonomousTurnId = null;
-    agent.lifecycle = "idle";
+    autonomousTurnId = "native-unrelated";
     rows.push({
       item: {
         type: "assistant_message",
