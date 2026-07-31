@@ -97,6 +97,44 @@ describe("workflow launch form model", () => {
     });
   });
 
+  it("preserves null defaults for every parameter shape", () => {
+    const nullDefaults: WorkflowValidationResult = {
+      valid: true,
+      issues: [],
+      summary: null,
+      parameters: [
+        {
+          name: "text",
+          type: "string",
+          description: "Optional text",
+          required: false,
+          defaultValue: null,
+        },
+        {
+          name: "items",
+          type: "array",
+          description: "Optional items",
+          required: false,
+          defaultValue: null,
+        },
+        {
+          name: "options",
+          type: "object",
+          description: "Optional options",
+          required: false,
+          defaultValue: null,
+        },
+      ],
+    };
+
+    const form = openWorkflowLaunchForm(nullDefaults);
+    expect(form.values).toEqual({ text: null, items: null, options: null });
+    expect(submitWorkflowLaunchForm(form, nullDefaults)).toEqual({
+      ok: true,
+      parameters: { text: null, items: null, options: null },
+    });
+  });
+
   it("returns field errors without discarding entered values", () => {
     let form = openWorkflowLaunchForm(validation);
     form = updateWorkflowLaunchValue(form, "concurrency", "many");

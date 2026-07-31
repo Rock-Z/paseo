@@ -707,6 +707,7 @@ export class WorkflowService {
         instance.activeTurn = null;
         instance.status = "runnable";
         role.status = "idle";
+        tx.state.loop.iteration -= 1;
         queueEvent(tx, {
           type: "turn_not_started",
           instanceId,

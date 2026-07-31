@@ -735,7 +735,9 @@ describe("WorkflowService runtime", () => {
   });
 
   it("does not submit a queued native turn after stop is acknowledged", async () => {
-    const { service, adapter } = await setup(baseSpec());
+    const spec = baseSpec();
+    spec.limits = { maxIterations: 1, maxRuntime: "1h" };
+    const { service, adapter } = await setup(spec);
     let releaseIdle!: () => void;
     adapter.idleGate = new Promise<void>((resolve) => {
       releaseIdle = resolve;
@@ -755,11 +757,28 @@ describe("WorkflowService runtime", () => {
       reason: "requested",
       resumable: true,
     });
+    await expect(service.inspectRun(run.id)).resolves.toMatchObject({
+      run: { iteration: 0 },
+    });
     expect(adapter.starts).toHaveLength(0);
     expect(adapter.externalEffects).toHaveLength(0);
     const details = await service.inspectRun(run.id);
     expect(details.events.find((event) => event.type === "turn_not_started")).toMatchObject({
       details: { reason: "stop_requested" },
+    });
+
+    await service.resumeRun(run.id);
+    await adapter.waitForStarts(1);
+    const resumed = adapter.starts[0];
+    await service.emitEvent({
+      callerAgentId: resumed.request.agentId,
+      event: "done",
+      message: "completed after resume",
+      data: { value: "resumed" },
+    });
+    adapter.complete(resumed.request.agentId);
+    await expect(waitForRunTerminal(service, run.id)).resolves.toMatchObject({
+      status: "complete",
     });
   });
 

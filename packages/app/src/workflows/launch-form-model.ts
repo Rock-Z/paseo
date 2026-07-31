@@ -11,7 +11,7 @@ export function openWorkflowLaunchForm(validation: WorkflowValidationResult): Wo
     values: Object.fromEntries(
       validation.parameters.map((parameter) => [
         parameter.name,
-        formatDefaultValue(parameter.defaultValue),
+        parameter.defaultValue === null ? null : formatDefaultValue(parameter.defaultValue),
       ]),
     ),
     errors: {},

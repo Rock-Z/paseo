@@ -35,6 +35,7 @@ import { SidebarResizeHandle } from "@/components/sidebar-resize-handle";
 import { Shortcut } from "@/components/ui/shortcut";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { HEADER_INNER_HEIGHT, useIsCompactFormFactor } from "@/constants/layout";
+import { isWeb } from "@/constants/platform";
 import { useOpenAddProject } from "@/hooks/use-open-add-project";
 import { useShortcutKeys } from "@/hooks/use-shortcut-keys";
 import { canCreateWorktreeForProjectKind } from "@/projects/host-projects";
@@ -883,14 +884,16 @@ function DesktopSidebar({
               testID="sidebar-schedules"
               variant="compact"
             />
-            <SidebarHeaderRow
-              icon={Workflow}
-              label="Workflows"
-              onPress={handleViewWorkflows}
-              isActive={isWorkflowsActive}
-              testID="sidebar-workflows"
-              variant="compact"
-            />
+            {isWeb ? (
+              <SidebarHeaderRow
+                icon={Workflow}
+                label="Workflows"
+                onPress={handleViewWorkflows}
+                isActive={isWorkflowsActive}
+                testID="sidebar-workflows"
+                variant="compact"
+              />
+            ) : null}
           </View>
         </View>
 
