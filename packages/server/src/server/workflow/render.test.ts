@@ -34,5 +34,8 @@ describe("workflow rendering", () => {
     expect(() => renderPrompt("{% for item in inputs %}x{% endfor %}", context)).toThrow(
       "unsupported workflow template tag",
     );
+    expect(() => renderPrompt("{{ inputs.objective | uppercase }}", context)).toThrow(
+      "unsupported workflow template",
+    );
   });
 });

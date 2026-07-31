@@ -47,6 +47,11 @@ the invoking turn to become idle without holding the submission request.
 
 States use one action: `turn`, `call`, `map`, `return`, or `stop`.
 
+Template interpolation uses `{{ path.to.value }}` with an optional `| trim`. Prompts also support
+non-nested `{% if path.to.value == "text" %}` blocks. Definition validation rejects other syntax.
+Count and pull-request-number fields accept positive integer literals or parameters declared as
+`integer`.
+
 `turn` routing accepts only a named `emit_event` tool call declared by that state. The event message
 becomes `event.message`; optional data is checked against the event's JSON Schema and becomes
 `event.data`. Invalid, missing, stale, unauthorized, and duplicate events do not route the flow.

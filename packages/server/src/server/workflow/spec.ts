@@ -5,7 +5,7 @@ import type {
   WorkflowValidationResult,
 } from "@getpaseo/protocol/workflow/types";
 import { canonicalJson, type JsonObject } from "./json.js";
-import { isExactValueExpression, promptTemplateIssue, renderValue } from "./render.js";
+import { isExactValueExpression, renderValue, templateIssue } from "./render.js";
 
 export { canonicalJson, type JsonObject } from "./json.js";
 
@@ -117,17 +117,17 @@ export function validateWorkflowTemplate(
   }
 
   const parameters = validateParameters(value.parameters, issues);
-  validateParameterReferences(value, parameters, issues);
+  validateTemplateExpressions(value, parameters, issues);
   const agents = validateAgents(value.agents, issues);
   validateBindings(value.bindings, agents, issues);
-  validateWorkspace(value.workspace, "workspace", issues);
+  validateWorkspace(value.workspace, "workspace", parameters, issues);
   validatePrompts(value.prompts, issues);
-  validateProtocol(value.protocol, issues);
-  validateLimits(value.limits, issues);
+  validateProtocol(value.protocol, parameters, issues);
+  validateLimits(value.limits, parameters, issues);
   if (value.inputs !== undefined && !isObject(value.inputs)) {
     issues.add("inputs", "must be an object");
   }
-  validateFlows(value.flows, value.entry, agents, value.prompts, issues);
+  validateFlows(value.flows, value.entry, agents, value.prompts, parameters, issues);
 
   const summary =
     typeof value.name === "string" &&
@@ -249,13 +249,13 @@ function validateParameters(value: unknown, issues: Issues): Map<string, JsonObj
   return result;
 }
 
-function validateParameterReferences(
+function validateTemplateExpressions(
   value: unknown,
   parameters: ReadonlyMap<string, JsonObject>,
   issues: Issues,
 ): void {
   const found = new Set<string>();
-  collectParameterReferences(value, found);
+  collectTemplateExpressions(value, "", found, issues);
   for (const name of [...found].sort()) {
     if (!parameters.has(name)) {
       issues.add(`parameters.${name}`, "referenced but not declared");
@@ -263,8 +263,15 @@ function validateParameterReferences(
   }
 }
 
-function collectParameterReferences(value: unknown, found: Set<string>): void {
+function collectTemplateExpressions(
+  value: unknown,
+  path: string,
+  found: Set<string>,
+  issues: Issues,
+): void {
   if (typeof value === "string") {
+    const issue = templateIssue(value, path.startsWith("prompts."));
+    if (issue) issues.add(path || "$", issue);
     for (const expression of value.matchAll(TEMPLATE_EXPRESSION)) {
       for (const match of (expression[1] ?? expression[2] ?? "").matchAll(PARAMETER_REFERENCE)) {
         found.add(match[1]);
@@ -273,8 +280,8 @@ function collectParameterReferences(value: unknown, found: Set<string>): void {
     return;
   }
   if (Array.isArray(value)) {
-    for (const item of value) {
-      collectParameterReferences(item, found);
+    for (const [index, item] of value.entries()) {
+      collectTemplateExpressions(item, `${path}[${index}]`, found, issues);
     }
     return;
   }
@@ -282,10 +289,10 @@ function collectParameterReferences(value: unknown, found: Set<string>): void {
     return;
   }
   for (const [key, item] of Object.entries(value)) {
-    if (key === "parameters") {
+    if (!path && key === "parameters") {
       continue;
     }
-    collectParameterReferences(item, found);
+    collectTemplateExpressions(item, path ? `${path}.${key}` : key, found, issues);
   }
 }
 
@@ -339,7 +346,12 @@ function validateAgentBindings(
   }
 }
 
-function validateWorkspace(value: unknown, path: string, issues: Issues): void {
+function validateWorkspace(
+  value: unknown,
+  path: string,
+  parameters: ReadonlyMap<string, JsonObject>,
+  issues: Issues,
+): void {
   if (!issues.object(value, path)) {
     return;
   }
@@ -378,7 +390,7 @@ function validateWorkspace(value: unknown, path: string, issues: Issues): void {
     }
   } else if (target.mode === "checkout-pr") {
     issues.unknown(target, targetPath, new Set(["mode", "prNumber"]));
-    if (!isPositiveIntegerOrParameter(target.prNumber)) {
+    if (!isPositiveIntegerOrParameter(target.prNumber, parameters)) {
       issues.add(`${targetPath}.prNumber`, "must be a positive integer");
     }
   } else {
@@ -470,14 +482,15 @@ function validatePrompts(value: unknown, issues: Issues): void {
   for (const [name, prompt] of Object.entries(value)) {
     if (typeof prompt !== "string") {
       issues.add(`prompts.${name}`, "must be a string");
-      continue;
     }
-    const issue = promptTemplateIssue(prompt);
-    if (issue) issues.add(`prompts.${name}`, issue);
   }
 }
 
-function validateProtocol(value: unknown, issues: Issues): void {
+function validateProtocol(
+  value: unknown,
+  parameters: ReadonlyMap<string, JsonObject>,
+  issues: Issues,
+): void {
   if (value === undefined) {
     return;
   }
@@ -485,12 +498,19 @@ function validateProtocol(value: unknown, issues: Issues): void {
     return;
   }
   issues.unknown(value, "protocol", new Set(["maxAttempts"]));
-  if (value.maxAttempts !== undefined && !isPositiveIntegerOrParameter(value.maxAttempts)) {
+  if (
+    value.maxAttempts !== undefined &&
+    !isPositiveIntegerOrParameter(value.maxAttempts, parameters)
+  ) {
     issues.add("protocol.maxAttempts", "must be a positive integer");
   }
 }
 
-function validateLimits(value: unknown, issues: Issues): void {
+function validateLimits(
+  value: unknown,
+  parameters: ReadonlyMap<string, JsonObject>,
+  issues: Issues,
+): void {
   if (value === undefined || value === null) {
     return;
   }
@@ -498,7 +518,10 @@ function validateLimits(value: unknown, issues: Issues): void {
     return;
   }
   issues.unknown(value, "limits", new Set(["maxIterations", "maxRuntime"]));
-  if (value.maxIterations !== undefined && !isPositiveIntegerOrParameter(value.maxIterations)) {
+  if (
+    value.maxIterations !== undefined &&
+    !isPositiveIntegerOrParameter(value.maxIterations, parameters)
+  ) {
     issues.add("limits.maxIterations", "must be a positive integer");
   }
   if (
@@ -515,6 +538,7 @@ function validateFlows(
   entry: unknown,
   agents: ReadonlyMap<string, JsonObject>,
   prompts: unknown,
+  parameters: ReadonlyMap<string, JsonObject>,
   issues: Issues,
 ): void {
   if (!issues.object(value, "flows") || Object.keys(value).length === 0) {
@@ -551,6 +575,7 @@ function validateFlows(
         flowNames,
         agents,
         promptNames,
+        parameters,
         issues,
       );
     }
@@ -643,6 +668,7 @@ function validateState(
   flowNames: ReadonlySet<string>,
   agents: ReadonlyMap<string, JsonObject>,
   promptNames: ReadonlySet<string>,
+  parameters: ReadonlyMap<string, JsonObject>,
   issues: Issues,
 ): void {
   if (!issues.object(value, path)) {
@@ -660,13 +686,13 @@ function validateState(
     const allowed = validateTurn(value.turn, path, agents, promptNames, routes, issues);
     validateAllowedRoutes(routes, allowed, path, issues);
   } else if (action === "call") {
-    validateCall(value.call, `${path}.call`, flowNames, issues);
+    validateCall(value.call, `${path}.call`, flowNames, parameters, issues);
     if (!routes.has("returned")) {
       issues.add(`${path}.on.returned`, "required");
     }
     validateAllowedRoutes(routes, new Set([...RUNTIME_EVENTS, "returned"]), path, issues);
   } else if (action === "map") {
-    validateMap(value.map, `${path}.map`, flowNames, issues);
+    validateMap(value.map, `${path}.map`, flowNames, parameters, issues);
     if (!routes.has("joined")) {
       issues.add(`${path}.on.joined`, "required");
     }
@@ -819,6 +845,7 @@ function validateCall(
   value: unknown,
   path: string,
   flowNames: ReadonlySet<string>,
+  parameters: ReadonlyMap<string, JsonObject>,
   issues: Issues,
 ): void {
   if (!issues.object(value, path)) {
@@ -841,7 +868,7 @@ function validateCall(
     } else if (keys[0] === "inherit" && value.workspace.inherit !== true) {
       issues.add(`${path}.workspace.inherit`, "must be true");
     } else if (keys[0] === "createWorktree") {
-      validateWorkspace(value.workspace, `${path}.workspace`, issues);
+      validateWorkspace(value.workspace, `${path}.workspace`, parameters, issues);
     }
   }
 }
@@ -850,6 +877,7 @@ function validateMap(
   value: unknown,
   path: string,
   flowNames: ReadonlySet<string>,
+  parameters: ReadonlyMap<string, JsonObject>,
   issues: Issues,
 ): void {
   if (!issues.object(value, path)) {
@@ -867,11 +895,14 @@ function validateMap(
   if (typeof value.as !== "string" || !IDENTIFIER.test(value.as)) {
     issues.add(`${path}.as`, "must be an identifier");
   }
-  validateCall(value.call, `${path}.call`, flowNames, issues);
+  validateCall(value.call, `${path}.call`, flowNames, parameters, issues);
   if (value.join !== "all") {
     issues.add(`${path}.join`, "must be all");
   }
-  if (value.concurrency !== undefined && !isPositiveIntegerOrParameter(value.concurrency)) {
+  if (
+    value.concurrency !== undefined &&
+    !isPositiveIntegerOrParameter(value.concurrency, parameters)
+  ) {
     issues.add(`${path}.concurrency`, "must be a positive integer");
   }
 }
@@ -1012,12 +1043,24 @@ function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
 
-function isPositiveIntegerOrParameter(value: unknown): boolean {
-  return isPositiveInteger(value) || isExactParameter(value);
+function isPositiveIntegerOrParameter(
+  value: unknown,
+  parameters: ReadonlyMap<string, JsonObject>,
+): boolean {
+  if (isPositiveInteger(value)) return true;
+  const name = exactParameterName(value);
+  if (!name) return false;
+  const declaration = parameters.get(name);
+  return !declaration || parameterType(declaration) === "integer";
 }
 
 function isExactParameter(value: unknown): boolean {
-  return typeof value === "string" && EXACT_PARAMETER_REFERENCE.test(value);
+  return exactParameterName(value) !== null;
+}
+
+function exactParameterName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  return value.match(EXACT_PARAMETER_REFERENCE)?.[1] ?? null;
 }
 
 function isObject(value: unknown): value is JsonObject {

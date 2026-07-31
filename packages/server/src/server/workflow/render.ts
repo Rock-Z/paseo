@@ -1,20 +1,33 @@
 import { canonicalJson, isJsonObject, type JsonObject } from "./json.js";
 
-const EXACT_VALUE = /^\s*{{\s*([A-Za-z_][A-Za-z0-9_.]*)\s*(?:\|\s*trim\s*)?}}\s*$/;
-const INLINE_VALUE = /{{\s*([A-Za-z_][A-Za-z0-9_.]*)\s*(?:\|\s*trim\s*)?}}/g;
-const IF_BLOCK =
-  /{%\s*if\s+([A-Za-z_][A-Za-z0-9_.]*)\s*==\s*(["'])(.*?)\2\s*%}([\s\S]*?){%\s*endif\s*%}/g;
+const VALUE_PATH = String.raw`[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*`;
+const EXACT_VALUE = new RegExp(String.raw`^\s*\{\{\s*(${VALUE_PATH})\s*(?:\|\s*trim\s*)?\}\}\s*$`);
+const INLINE_VALUE = new RegExp(String.raw`\{\{\s*(${VALUE_PATH})\s*(?:\|\s*trim\s*)?\}\}`, "g");
+const IF_BLOCK = new RegExp(
+  String.raw`\{%\s*if\s+(${VALUE_PATH})\s*==\s*(["'])(.*?)\2\s*%\}([\s\S]*?)\{%\s*endif\s*%\}`,
+  "g",
+);
+const VALUE_EXPRESSION = new RegExp(String.raw`^${VALUE_PATH}\s*(?:\|\s*trim\s*)?$`);
+const ALL_VALUES = /\{\{([\s\S]*?)\}\}/g;
 const ANY_TAG = /{%\s*([^%]+?)\s*%}/;
 const ALL_TAGS = /{%\s*([^%]+?)\s*%}/g;
-const IF_TAG = /^if\s+[A-Za-z_][A-Za-z0-9_.]*\s*==\s*(["']).*?\1$/;
+const IF_TAG = new RegExp(String.raw`^if\s+${VALUE_PATH}\s*==\s*(["']).*?\1$`);
 
 export function isExactValueExpression(value: unknown): value is string {
   return typeof value === "string" && EXACT_VALUE.test(value);
 }
 
-export function promptTemplateIssue(template: string): string | null {
+export function templateIssue(template: string, allowConditionals = false): string | null {
+  const interpolation = interpolationIssue(template);
+  if (interpolation) return interpolation;
+  const withoutValues = template.replace(ALL_VALUES, "");
+  if (!allowConditionals) {
+    const unsupported = withoutValues.match(ANY_TAG);
+    if (unsupported) return `has unsupported template tag: ${unsupported[1].trim()}`;
+    return hasUnbalancedSyntax(withoutValues, "{%", "%}") ? "has an unbalanced template tag" : null;
+  }
   let open = false;
-  for (const match of template.matchAll(ALL_TAGS)) {
+  for (const match of withoutValues.matchAll(ALL_TAGS)) {
     const tag = match[1].trim();
     if (IF_TAG.test(tag)) {
       if (open) return "has an unsupported nested if block";
@@ -28,7 +41,10 @@ export function promptTemplateIssue(template: string): string | null {
     }
     return `has unsupported template tag: ${tag}`;
   }
-  return open ? "has an unbalanced if block" : null;
+  if (open) return "has an unbalanced if block";
+  return hasUnbalancedSyntax(withoutValues.replace(ALL_TAGS, ""), "{%", "%}")
+    ? "has an unbalanced template tag"
+    : null;
 }
 
 export function renderPrompt(template: string, context: JsonObject): string {
@@ -80,12 +96,30 @@ function renderString(
   context: JsonObject,
   options: { preserveUndefined?: boolean } = {},
 ): string {
+  const issue = interpolationIssue(value);
+  if (issue) throw new Error(`unsupported workflow template: ${issue}`);
   return value.replace(INLINE_VALUE, (match, path: string) => {
     const resolved = tryResolvePath(context, path);
     if (resolved.found) return stringify(resolved.value);
     if (options.preserveUndefined) return match;
     throw new Error(`undefined workflow value: ${path}`);
   });
+}
+
+function interpolationIssue(template: string): string | null {
+  for (const match of template.matchAll(ALL_VALUES)) {
+    const expression = match[1].trim();
+    if (!VALUE_EXPRESSION.test(expression)) {
+      return `has unsupported interpolation: ${expression}`;
+    }
+  }
+  return hasUnbalancedSyntax(template.replace(ALL_VALUES, ""), "{{", "}}")
+    ? "has an unbalanced interpolation"
+    : null;
+}
+
+function hasUnbalancedSyntax(value: string, open: string, close: string): boolean {
+  return value.includes(open) || value.includes(close);
 }
 
 function resolvePath(context: JsonObject, expression: string): unknown {

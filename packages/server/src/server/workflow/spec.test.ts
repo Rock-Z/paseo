@@ -263,6 +263,24 @@ describe("workflow spec validation and materialization", () => {
     });
   });
 
+  it.each([
+    ["{{ inputs.objective | uppercase }}", "inputs.objective | uppercase"],
+    ["{{ inputs..objective }}", "inputs..objective"],
+  ])(
+    "rejects unsupported prompt interpolation %j before a run is saved",
+    (template, expression) => {
+      const spec = baseSpec();
+      (spec.prompts as Record<string, unknown>).work = template;
+
+      const result = validateWorkflowTemplate(spec);
+      expect(result.valid).toBe(false);
+      expect(result.issues).toContainEqual({
+        path: "prompts.work",
+        message: `has unsupported interpolation: ${expression}`,
+      });
+    },
+  );
+
   it("rejects recursive flow calls", () => {
     const spec = baseSpec();
     spec.flows = {
@@ -478,6 +496,50 @@ describe("workflow spec validation and materialization", () => {
       },
       on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
     };
+    expect(validateWorkflowTemplate(spec)).toMatchObject({ valid: true, issues: [] });
+  });
+
+  it("requires integer parameters for numeric-only fields", () => {
+    const spec = baseSpec();
+    const parameter = { type: "string", default: "2" };
+    (spec.parameters as Record<string, unknown>).count = parameter;
+    const count = "{{ parameters.count }}";
+    spec.protocol = { maxAttempts: count };
+    spec.limits = { maxIterations: count, maxRuntime: "1h" };
+    const workspace = spec.workspace as Record<string, Record<string, unknown>>;
+    workspace.createWorktree.target = { mode: "checkout-pr", prNumber: count };
+    const flows = spec.flows as Record<string, Record<string, unknown>>;
+    flows.child = {
+      initial: "finish",
+      inputs: {},
+      states: { finish: { return: { output: "{{ inputs }}" } } },
+    };
+    const states = flows.main.states as Record<string, Record<string, unknown>>;
+    states.work = {
+      map: {
+        group: "items",
+        items: "{{ inputs.items }}",
+        as: "item",
+        call: { flow: "child", with: { item: "{{ item }}" } },
+        join: "all",
+        concurrency: count,
+      },
+      on: { joined: "finish", "error.agent": "failed", "error.protocol": "failed" },
+    };
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues.map((issue) => issue.path)).toEqual(
+      expect.arrayContaining([
+        "workspace.createWorktree.target.prNumber",
+        "protocol.maxAttempts",
+        "limits.maxIterations",
+        "flows.main.states.work.map.concurrency",
+      ]),
+    );
+
+    parameter.type = "integer";
+    parameter.default = 2;
     expect(validateWorkflowTemplate(spec)).toMatchObject({ valid: true, issues: [] });
   });
 
