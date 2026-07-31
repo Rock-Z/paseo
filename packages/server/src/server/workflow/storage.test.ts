@@ -135,6 +135,56 @@ describe("WorkflowStorage", () => {
     expect(files.some((name) => name.endsWith(".tmp"))).toBe(false);
   });
 
+  it("summarizes only native identities from identity-bearing instance fields", async () => {
+    const { storage } = await makeStorage();
+    const now = "2026-07-30T00:00:00.000Z";
+    await storage.createRun("identity-summary", spec(), {
+      schemaVersion: "paseo.workflows.run.v0.2",
+      runId: "identity-summary",
+      workflow: { id: "custom", name: "custom" },
+      status: "running",
+      reason: null,
+      createdAt: now,
+      updatedAt: now,
+      startedAt: now,
+      completedAt: null,
+      loop: { iteration: 1, elapsedSeconds: 0 },
+      eventSeq: 1,
+      result: {
+        agentId: "agent-result-data",
+        workspaceId: "workspace-result-data",
+      },
+      instances: {
+        root: {
+          workspace: { workspaceId: "workspace-real", cwd: "/repo" },
+          inputs: {
+            agentId: "agent-input-data",
+            workspaceId: "workspace-input-data",
+          },
+          incoming: {
+            data: {
+              agentId: "agent-event-data",
+              workspaceId: "workspace-event-data",
+            },
+          },
+          activeTurn: { agentId: "agent-active" },
+          agents: {
+            worker: {
+              agentId: "agent-bound",
+              turns: [{ agentId: "agent-completed" }],
+            },
+          },
+        },
+      },
+    });
+
+    const [summary] = await storage.listRuns();
+    expect(new Set(summary.workspaceIds)).toEqual(new Set(["workspace-real"]));
+    expect(new Set(summary.agentIds)).toEqual(
+      new Set(["agent-bound", "agent-active", "agent-completed"]),
+    );
+  });
+
   it.each([
     { step: "journal", phase: "before" },
     { step: "journal", phase: "after" },

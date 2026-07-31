@@ -62,9 +62,9 @@ const WORKFLOW_VALUE_ROOTS = new Set([
   "agents",
   "groups",
   "instance",
-  "task",
-  "item",
 ]);
+const MAP_INSTANCE_VALUE_ROOTS = new Set([...WORKFLOW_VALUE_ROOTS, "task", "item"]);
+const PARAMETER_VALUE_ROOTS = new Set(["parameters"]);
 const SLUG = /^[a-z0-9][a-z0-9-]*$/;
 const AGENT_NAME = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -140,7 +140,7 @@ function validateWorkflow(
   }
 
   const parameters = validateParameters(value.parameters, issues);
-  validateTemplateExpressions(value, parameters, WORKFLOW_VALUE_ROOTS, issues);
+  validateTemplateExpressions(value, parameters, issues);
   const agents = validateAgents(value.agents, issues);
   validateBindings(value.bindings, agents, issues);
   validateWorkspace(value.workspace, "workspace", parameters, issues);
@@ -283,11 +283,37 @@ function validateParameters(value: unknown, issues: Issues): Map<string, JsonObj
 function validateTemplateExpressions(
   value: unknown,
   parameters: ReadonlyMap<string, JsonObject>,
-  roots: ReadonlySet<string>,
   issues: Issues,
 ): void {
   const found = new Set<string>();
-  collectTemplateExpressions(value, "", found, roots, issues);
+  if (!isObject(value)) {
+    collectTemplateExpressions(value, "", found, PARAMETER_VALUE_ROOTS, issues);
+  } else {
+    const scopes = templateScopes(value);
+    const withoutPrompts = Object.fromEntries(
+      Object.entries(value).filter(([key]) => key !== "parameters" && key !== "prompts"),
+    );
+    collectTemplateExpressions(
+      withoutPrompts,
+      "",
+      found,
+      PARAMETER_VALUE_ROOTS,
+      issues,
+      scopes.overrides,
+    );
+    if (isObject(value.prompts)) {
+      for (const [name, prompt] of Object.entries(value.prompts)) {
+        const usages = scopes.promptFlows.get(name);
+        const roots =
+          usages &&
+          usages.size > 0 &&
+          [...usages].every((flowName) => scopes.mapOnlyFlows.has(flowName))
+            ? MAP_INSTANCE_VALUE_ROOTS
+            : WORKFLOW_VALUE_ROOTS;
+        collectTemplateExpressions(prompt, `prompts.${name}`, found, roots, issues);
+      }
+    }
+  }
   for (const name of [...found].sort()) {
     if (!parameters.has(name)) {
       issues.add(`parameters.${name}`, "referenced but not declared");
@@ -301,6 +327,7 @@ function collectTemplateExpressions(
   found: Set<string>,
   roots: ReadonlySet<string>,
   issues: Issues,
+  overrides?: WeakMap<JsonObject, ReadonlySet<string>>,
 ): void {
   if (typeof value === "string") {
     const issue = templateIssue(value, path.startsWith("prompts."), roots);
@@ -313,22 +340,27 @@ function collectTemplateExpressions(
   }
   if (Array.isArray(value)) {
     for (const [index, item] of value.entries()) {
-      collectTemplateExpressions(item, `${path}[${index}]`, found, roots, issues);
+      collectTemplateExpressions(item, `${path}[${index}]`, found, roots, issues, overrides);
     }
     return;
   }
   if (!isObject(value)) {
     return;
   }
+  const scopedRoots = overrides?.get(value) ?? roots;
   for (const [key, item] of Object.entries(value)) {
-    if (!path && key === "parameters") {
-      continue;
-    }
     const itemPath = path ? `${path}.${key}` : key;
     if (key === "map" && isObject(item)) {
-      collectMapTemplateExpressions(item, itemPath, found, roots, issues);
+      collectMapTemplateExpressions(
+        item,
+        itemPath,
+        found,
+        overrides?.get(item) ?? scopedRoots,
+        issues,
+        overrides,
+      );
     } else {
-      collectTemplateExpressions(item, itemPath, found, roots, issues);
+      collectTemplateExpressions(item, itemPath, found, scopedRoots, issues, overrides);
     }
   }
 }
@@ -339,8 +371,9 @@ function collectMapTemplateExpressions(
   found: Set<string>,
   roots: ReadonlySet<string>,
   issues: Issues,
+  overrides?: WeakMap<JsonObject, ReadonlySet<string>>,
 ): void {
-  const callRoots = new Set(roots);
+  const callRoots = new Set([...roots, "task", "item"]);
   if (typeof map.as === "string" && IDENTIFIER.test(map.as)) {
     callRoots.add(map.as);
   }
@@ -351,8 +384,79 @@ function collectMapTemplateExpressions(
       found,
       key === "call" ? callRoots : roots,
       issues,
+      overrides,
     );
   }
+}
+
+function templateScopes(value: JsonObject): {
+  overrides: WeakMap<JsonObject, ReadonlySet<string>>;
+  mapOnlyFlows: ReadonlySet<string>;
+  promptFlows: ReadonlyMap<string, ReadonlySet<string>>;
+} {
+  const flows = isObject(value.flows) ? value.flows : {};
+  const { mapOnlyFlows, promptFlows } = templateFlowFacts(flows, value.entry);
+  return {
+    overrides: templateActionOverrides(flows, mapOnlyFlows),
+    mapOnlyFlows,
+    promptFlows,
+  };
+}
+
+function templateFlowFacts(
+  flows: JsonObject,
+  entry: unknown,
+): {
+  mapOnlyFlows: ReadonlySet<string>;
+  promptFlows: ReadonlyMap<string, ReadonlySet<string>>;
+} {
+  const ordinaryFlowTargets = new Set<string>();
+  const mapFlowTargets = new Set<string>();
+  const promptFlows = new Map<string, Set<string>>();
+  if (typeof entry === "string") ordinaryFlowTargets.add(entry);
+  for (const [flowName, flowValue] of Object.entries(flows)) {
+    if (!isObject(flowValue) || !isObject(flowValue.states)) continue;
+    for (const stateValue of Object.values(flowValue.states)) {
+      if (!isObject(stateValue)) continue;
+      if (isObject(stateValue.call) && typeof stateValue.call.flow === "string") {
+        ordinaryFlowTargets.add(stateValue.call.flow);
+      }
+      if (
+        isObject(stateValue.map) &&
+        isObject(stateValue.map.call) &&
+        typeof stateValue.map.call.flow === "string"
+      ) {
+        mapFlowTargets.add(stateValue.map.call.flow);
+      }
+      if (isObject(stateValue.turn) && typeof stateValue.turn.prompt === "string") {
+        const usages = promptFlows.get(stateValue.turn.prompt) ?? new Set<string>();
+        usages.add(flowName);
+        promptFlows.set(stateValue.turn.prompt, usages);
+      }
+    }
+  }
+  const mapOnlyFlows = new Set(
+    [...mapFlowTargets].filter((flowName) => !ordinaryFlowTargets.has(flowName)),
+  );
+  return { mapOnlyFlows, promptFlows };
+}
+
+function templateActionOverrides(
+  flows: JsonObject,
+  mapOnlyFlows: ReadonlySet<string>,
+): WeakMap<JsonObject, ReadonlySet<string>> {
+  const overrides = new WeakMap<JsonObject, ReadonlySet<string>>();
+  for (const [flowName, flowValue] of Object.entries(flows)) {
+    if (!isObject(flowValue) || !isObject(flowValue.states)) continue;
+    const roots = mapOnlyFlows.has(flowName) ? MAP_INSTANCE_VALUE_ROOTS : WORKFLOW_VALUE_ROOTS;
+    for (const stateValue of Object.values(flowValue.states)) {
+      if (!isObject(stateValue)) continue;
+      for (const action of ["call", "map", "return", "stop"]) {
+        if (isObject(stateValue[action])) overrides.set(stateValue[action], roots);
+      }
+    }
+  }
+  return overrides;
 }
 
 function validateBindings(
@@ -1122,7 +1226,7 @@ function validateMap(
   }
   if (typeof value.as !== "string" || !IDENTIFIER.test(value.as)) {
     issues.add(`${path}.as`, "must be an identifier");
-  } else if (value.as !== "item" && WORKFLOW_VALUE_ROOTS.has(value.as)) {
+  } else if (value.as !== "item" && MAP_INSTANCE_VALUE_ROOTS.has(value.as)) {
     issues.add(`${path}.as`, "must not shadow a workflow value root");
   }
   validateCall(value.call, `${path}.call`, flowNames, parameters, issues);

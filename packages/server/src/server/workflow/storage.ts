@@ -424,8 +424,7 @@ function summarizeRun(runId: string, state: JsonObject, legacy: boolean): Workfl
   ).length;
   const agentIds = new Set<string>();
   const workspaceIds = new Set<string>();
-  collectIdentities(state, "agentId", agentIds);
-  collectIdentities(state, "workspaceId", workspaceIds);
+  collectRunIdentities(state, agentIds, workspaceIds);
   const workflow = isObject(state.workflow) ? state.workflow : {};
   const loop = isObject(state.loop) ? state.loop : {};
   const now = new Date(0).toISOString();
@@ -456,16 +455,31 @@ function summarizeRun(runId: string, state: JsonObject, legacy: boolean): Workfl
   };
 }
 
-function collectIdentities(value: unknown, key: string, result: Set<string>): void {
-  if (Array.isArray(value)) {
-    for (const item of value) collectIdentities(item, key, result);
-    return;
+function collectRunIdentities(
+  state: JsonObject,
+  agentIds: Set<string>,
+  workspaceIds: Set<string>,
+): void {
+  if (!isObject(state.instances)) return;
+  for (const instance of Object.values(state.instances)) {
+    if (!isObject(instance)) continue;
+    if (isObject(instance.workspace)) addIdentity(instance.workspace.workspaceId, workspaceIds);
+    if (isObject(instance.activeTurn)) addIdentity(instance.activeTurn.agentId, agentIds);
+    if (isObject(instance.repair)) addIdentity(instance.repair.agentId, agentIds);
+    if (!isObject(instance.agents)) continue;
+    for (const role of Object.values(instance.agents)) {
+      if (!isObject(role)) continue;
+      addIdentity(role.agentId, agentIds);
+      if (!Array.isArray(role.turns)) continue;
+      for (const turn of role.turns) {
+        if (isObject(turn)) addIdentity(turn.agentId, agentIds);
+      }
+    }
   }
-  if (!isObject(value)) return;
-  for (const [name, item] of Object.entries(value)) {
-    if (name === key && typeof item === "string" && item) result.add(item);
-    else collectIdentities(item, key, result);
-  }
+}
+
+function addIdentity(value: unknown, result: Set<string>): void {
+  if (typeof value === "string" && value) result.add(value);
 }
 
 async function readEvents(filePath: string): Promise<WorkflowEventRecord[]> {

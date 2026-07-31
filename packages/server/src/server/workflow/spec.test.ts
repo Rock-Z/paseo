@@ -349,7 +349,7 @@ describe("workflow spec validation and materialization", () => {
   it("rejects unsupported prompt template tags before a run is saved", () => {
     const spec = baseSpec();
     (spec.prompts as Record<string, unknown>).work =
-      "{% for item in inputs %}{{ item }}{% endfor %}";
+      "{% for item in inputs %}{{ inputs.objective }}{% endfor %}";
 
     const result = validateWorkflowTemplate(spec);
     expect(result.valid).toBe(false);
@@ -417,6 +417,123 @@ describe("workflow spec validation and materialization", () => {
     expect(result.issues).toContainEqual({
       path: "prompts.work",
       message: "has unsupported workflow value root: branch",
+    });
+  });
+
+  it.each([
+    ["task", "{{ task.index }}"],
+    ["item", "{{ item }}"],
+  ])("rejects the map-only %s root in a root prompt", (_root, prompt) => {
+    const spec = baseSpec();
+    (spec.prompts as JsonObject).work = prompt;
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "prompts.work",
+      message: `has unsupported workflow value root: ${String(_root)}`,
+    });
+  });
+
+  it("rejects map-only prompt roots when the flow also has an ordinary caller", () => {
+    const spec = baseSpec();
+    spec.inputs = { items: [] };
+    (spec.prompts as JsonObject).child = "Task {{ task.index }}";
+    spec.flows = {
+      main: {
+        initial: "direct",
+        states: {
+          direct: { call: { flow: "child" }, on: { returned: "finish" } },
+          fanout: {
+            map: {
+              group: "branches",
+              items: "{{ inputs.items }}",
+              as: "item",
+              call: { flow: "child" },
+              join: "all",
+            },
+            on: { joined: "finish" },
+          },
+          finish: { return: { output: null } },
+        },
+      },
+      child: {
+        initial: "work",
+        states: {
+          work: {
+            turn: {
+              agent: "worker",
+              prompt: "child",
+              emits: { done: { description: "Done" } },
+            },
+            on: { done: "finish", "error.agent": "finish", "error.protocol": "finish" },
+          },
+          finish: { return: { output: null } },
+        },
+      },
+    };
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "prompts.child",
+      message: "has unsupported workflow value root: task",
+    });
+  });
+
+  it("allows task roots in a prompt used only by a map-created flow", () => {
+    const spec = baseSpec();
+    spec.inputs = { items: [] };
+    (spec.prompts as JsonObject).child = "Task {{ task.index }}";
+    spec.flows = {
+      main: {
+        initial: "fanout",
+        states: {
+          fanout: {
+            map: {
+              group: "branches",
+              items: "{{ inputs.items }}",
+              as: "item",
+              call: { flow: "child" },
+              join: "all",
+            },
+            on: { joined: "finish" },
+          },
+          finish: { return: { output: null } },
+        },
+      },
+      child: {
+        initial: "work",
+        states: {
+          work: {
+            turn: {
+              agent: "worker",
+              prompt: "child",
+              emits: { done: { description: "Done" } },
+            },
+            on: { done: "finish", "error.agent": "finish", "error.protocol": "finish" },
+          },
+          finish: { return: { output: null } },
+        },
+      },
+    };
+
+    expect(validateWorkflowTemplate(spec).valid).toBe(true);
+  });
+
+  it("rejects runtime expressions in agent creation declarations", () => {
+    const spec = baseSpec();
+    spec.inputs = { roleName: "worker" };
+    const agents = spec.agents as JsonObject;
+    const worker = agents.worker as JsonObject;
+    const createAgent = worker.createAgent as JsonObject;
+    createAgent.title = "{{ inputs.roleName }}";
+
+    const result = validateWorkflowTemplate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual({
+      path: "agents.worker.createAgent.title",
+      message: "has unsupported workflow value root: inputs",
     });
   });
 
